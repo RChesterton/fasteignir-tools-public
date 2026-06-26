@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Icelandic Web Helper
 // @namespace    fasteignir-tools
-// @version      0.10
+// @version      0.11
 // @description  Translation nudges, description expansion, Fasteignaleitin/Fasteignir cross-links, and Fasteignir search-save repair
 // @match        https://fasteignir.visir.is/*
 // @match        https://fasteignir.is/*
@@ -379,6 +379,15 @@
 
       const detailMatches = addressMatches.filter((candidate) => detailsMatch(propertyData, candidate));
       if (detailMatches.length === 1) return detailMatches[0].url;
+
+      // Multiple indistinguishable matches — happens when the same unit is relisted
+      // under a new ID with identical details. Pick the newest (highest numeric ID)
+      // as it's the currently active listing.
+      if (detailMatches.length > 1) {
+        const newest = detailMatches.reduce((a, b) => (Number(a.id) >= Number(b.id) ? a : b));
+        console.warn('[Icelandic Web Helper] cross-link: multiple identical matches, picking newest', newest.id);
+        return newest.url;
+      }
 
       console.warn('[Icelandic Web Helper] cross-link did not resolve uniquely', {
         propertyData,
