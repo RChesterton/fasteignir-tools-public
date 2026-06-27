@@ -1,246 +1,17 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.11
+// @version      3.12
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
-// @match        https://fasteignir.visir.is/search/results/*
 // @updateURL    https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-dashboard-helper.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-dashboard-helper.user.js
 // @grant        none
-// @run-at       document-idle
+// @run-at       document-end
 // ==/UserScript==
-
-// ============================================================================
-// REQUIRED BROWSER SETTING - READ BEFORE USING "Remove Sold" (bulk):
-// This script opens MULTIPLE search tabs in quick succession via window.open().
-// Browsers only reliably allow popups in direct response to a user click -
-// once a tab is more than one or two calls removed from that original click
-// (or a blocking confirm() dialog has been shown in between), it's likely to
-// be silently blocked. Confirmed via live testing: without a permanent
-// popup-allow exception for fasteignir.visir.is, a bulk run can fail to open
-// most of its search tabs, leaving affected properties stuck reporting
-// "could not be confirmed."
-//   Firefox: Settings -> Privacy & Security -> Permissions -> Block pop-up
-//            windows -> Exceptions... -> add https://fasteignir.visir.is -> Allow
-//   Chrome:  Settings -> Privacy and security -> Site settings -> Pop-ups and
-//            redirects -> Add (under "Allowed to send pop-ups") -> add the site
-// Set this up BEFORE running "Remove Sold" in any new browser or profile.
-// ============================================================================
 
 (function () {
   'use strict';
-
-  // ---------- Search-results tab: verify, auto-favorite, report back ----------
-  // When the dashboard script opens a search tab to check for a relisting, it
-  // does so via window.open(), which sets window.opener on the new tab. We use
-  // that to make sure we ONLY act on tabs our own script opened - never a
-  // search tab the person opened themselves, even if it has zero results.
-  // Before closing (or giving up), this tab reports its outcome back to the
-  // dashboard tab via postMessage, since that's the only way the dashboard
-  // can know what happened in a separate browser tab.
-  if (location.pathname.startsWith('/search/results')) {
-    if (window.opener) {
-      const params = new URLSearchParams(location.search);
-      const propertyId = params.get('fdhPropId') || '';
-      const isBulk = params.get('fdhBulk') === '1';
-      const expectedSize = params.has('fdhSize') ? parseFloat(params.get('fdhSize')) : null;
-      const expectedRooms = params.has('fdhRooms') ? parseInt(params.get('fdhRooms'), 10) : null;
-      const expectedBaths = params.has('fdhBaths') ? parseInt(params.get('fdhBaths'), 10) : null;
-      const expectedBeds = params.has('fdhBeds') ? parseInt(params.get('fdhBeds'), 10) : null;
-
-      function reportBack(outcome, extra) {
-        try {
-          if (window.opener && !window.opener.closed) {
-            window.opener.postMessage(
-              { type: 'fdhRelistResult', propertyId, outcome, ...(extra || {}) },
-              location.origin
-            );
-          }
-        } catch (e) {
-          console.warn('[Fasteignir Helper] could not report search result back:', e);
-        }
-      }
-
-      // Clicking "add to favorites" triggers one of two native alert()
-      // popups from the site itself. These aren't blocking anything that
-      // matters here, but suppressing them lets us read their exact wording
-      // to know definitively whether the save actually went through, rather
-      // than just assuming success because a click happened.
-      let lastFavoriteOutcome = null; // 'already-saved' | 'newly-saved' | null
-      const originalAlertHere = window.alert.bind(window);
-      window.alert = function (msg) {
-        if (typeof msg === 'string') {
-          if (msg.includes('þegar verið vistuð')) {
-            lastFavoriteOutcome = 'already-saved';
-            console.log('[Fasteignir Helper] suppressed "already saved" popup:', msg);
-            return undefined;
-          }
-          if (msg.includes('hefur verið vistuð')) {
-            lastFavoriteOutcome = 'newly-saved';
-            console.log('[Fasteignir Helper] suppressed "saved" popup:', msg);
-            return undefined;
-          }
-        }
-        return originalAlertHere(msg);
-      };
-
-      // Strict exact match on every criterion we have ground truth for. If
-      // the original property itself never showed a given stat, we skip
-      // that check (nothing to compare against) - but if we DO know the
-      // original's value, the candidate must show a matching value too; a
-      // candidate missing that data point is rejected, not given the
-      // benefit of the doubt, since we can't confirm it's correct. No
-      // tolerance on size - a genuine relisting is treated as having the
-      // exact same size; a real but unexplained difference is instead
-      // flagged separately by isAreaMismatchCandidate below, rather than
-      // silently absorbed or silently ignored.
-      function isRealMatch(cardEl) {
-        if (expectedSize != null) {
-          const sizeEl = cardEl.querySelector('.estate__parameters--1');
-          const size = sizeEl ? parseSize(sizeEl.textContent) : null;
-          if (size == null || Math.abs(size - expectedSize) > 0.05) return false;
-        }
-        if (expectedRooms != null) {
-          const roomsEl = cardEl.querySelector('.estate__parameters--2');
-          const rooms = roomsEl ? parseIntSafe(roomsEl.textContent) : null;
-          if (rooms == null || rooms !== expectedRooms) return false;
-        }
-        if (expectedBaths != null) {
-          const bathsEl = cardEl.querySelector('.estate__parameters--3');
-          const baths = bathsEl ? parseIntSafe(bathsEl.textContent) : null;
-          if (baths == null || baths !== expectedBaths) return false;
-        }
-        if (expectedBeds != null) {
-          const bedsEl = cardEl.querySelector('.estate__parameters--4');
-          const beds = bedsEl ? parseIntSafe(bedsEl.textContent) : null;
-          if (beds == null || beds !== expectedBeds) return false;
-        }
-        return true;
-      }
-
-      // Matches on every known criterion EXCEPT size, where it must show a
-      // confirmed different value (not just missing data) - this is the
-      // "probably the same property, but the floor area changed" case,
-      // which we flag for manual review rather than silently treating as
-      // either a match or a non-match.
-      function isAreaMismatchCandidate(cardEl) {
-        if (expectedRooms != null) {
-          const roomsEl = cardEl.querySelector('.estate__parameters--2');
-          const rooms = roomsEl ? parseIntSafe(roomsEl.textContent) : null;
-          if (rooms == null || rooms !== expectedRooms) return false;
-        }
-        if (expectedBaths != null) {
-          const bathsEl = cardEl.querySelector('.estate__parameters--3');
-          const baths = bathsEl ? parseIntSafe(bathsEl.textContent) : null;
-          if (baths == null || baths !== expectedBaths) return false;
-        }
-        if (expectedBeds != null) {
-          const bedsEl = cardEl.querySelector('.estate__parameters--4');
-          const beds = bedsEl ? parseIntSafe(bedsEl.textContent) : null;
-          if (beds == null || beds !== expectedBeds) return false;
-        }
-        if (expectedSize == null) return false; // nothing to compare against
-        const sizeEl = cardEl.querySelector('.estate__parameters--1');
-        const size = sizeEl ? parseSize(sizeEl.textContent) : null;
-        if (size == null) return false; // can't confirm an actual difference
-        if (Math.abs(size - expectedSize) <= 0.05) return false; // this would already be an exact match
-        return true;
-      }
-
-      // Clicks a card's favorite button and watches for the resulting
-      // confirmation. This turns out to be a visible on-page popup rather
-      // than a native alert() in at least some cases (our alert override
-      // wouldn't catch that), so we poll the page's own text for the two
-      // known phrases as well, on top of whatever the override captures.
-      async function favoriteCard(cardEl) {
-        lastFavoriteOutcome = null;
-        const favBtn = cardEl.querySelector('.add-to-favorites');
-        if (!favBtn) return 'no-fav-button';
-        favBtn.click();
-        const maxChecks = 10; // up to ~3 seconds
-        for (let i = 0; i < maxChecks; i++) {
-          await new Promise((r) => setTimeout(r, 300));
-          if (lastFavoriteOutcome) return lastFavoriteOutcome;
-          const text = document.body.innerText;
-          if (text.includes('þegar verið vistuð')) return 'already-saved';
-          if (text.includes('hefur verið vistuð')) return 'newly-saved';
-        }
-        return lastFavoriteOutcome || 'unknown-after-click';
-      }
-
-      let attempts = 0;
-      const maxAttempts = 16; // ~8 seconds, fallback only - see noResults check below
-
-      async function poll() {
-        attempts++;
-        const allCards = Array.from(document.querySelectorAll('.estate__item[data-id]'));
-        const matches = allCards.filter(isRealMatch);
-        const noResults = document.body.innerText.includes('Leitin skilaði engum niðurstöðum');
-
-        if (noResults) {
-          reportBack('no-match');
-          window.close();
-          return;
-        }
-
-        if (matches.length > 0) {
-          // One or more cards passed the strict exact-match check. Two
-          // genuinely different listings never share an identical exact
-          // match on every known criterion, so if more than one DISTINCT
-          // property ID passes here, it's a genuine extra relisting worth
-          // saving too - not just the same card rendered twice.
-          const confirmedIds = new Set();
-          for (const card of matches) {
-            const outcome = await favoriteCard(card);
-            console.log('[Fasteignir Helper] favorite outcome for', card.dataset.id, ':', outcome);
-            if (outcome === 'already-saved' || outcome === 'newly-saved') {
-              confirmedIds.add(card.dataset.id);
-            }
-            await new Promise((r) => setTimeout(r, 300));
-          }
-          const savedCount = confirmedIds.size;
-          // Read the price off the first match for the dashboard's price-
-          // change comparison.
-          const priceEl = matches[0].querySelector('.estate__price');
-          const priceText = priceEl ? priceEl.textContent.trim() : '';
-          const newPrice = priceEl ? parsePrice(priceEl.textContent) : null;
-          const newIsTilbod = newPrice == null && /tilbo/i.test(priceText);
-          reportBack(savedCount > 0 ? 'favorited' : 'unknown-after-click', { newPrice, newIsTilbod, savedCount });
-          setTimeout(() => window.close(), 500);
-          return;
-        }
-
-        // No exact match yet. Keep waiting in case the page is still
-        // rendering. Only once we've fully given up do we check for an
-        // area-mismatch candidate - checking earlier risks a false read on
-        // a partially-rendered page.
-        if (attempts >= maxAttempts) {
-          const areaMismatches = allCards.filter(isAreaMismatchCandidate);
-          if (areaMismatches.length > 0) {
-            if (!isBulk) {
-              areaMismatches.forEach((card) => {
-                card.style.outline = '3px solid #d98c00';
-                card.style.outlineOffset = '2px';
-              });
-            }
-            reportBack('area-mismatch');
-            if (isBulk) {
-              window.close();
-            }
-            // else: leave the tab open intentionally for manual review.
-            return;
-          }
-          reportBack('no-match');
-          window.close();
-          return;
-        }
-        setTimeout(poll, 500);
-      }
-      poll();
-    }
-    return;
-  }
 
   // ---------- Suppress the native "deleted" confirmation popup ----------
   // Clicking the "x" triggers the site's own removal handler, which calls a
@@ -760,7 +531,7 @@
     applyFilter();
     reloadImages();
   });
-  document.getElementById('fdh-address-filter').addEventListener('input', applyFilter);
+  document.getElementById('fdh-address-filter').addEventListener('input', () => applyFilter());
 
   function setFilterControlsDisabled(disabled) {
     toolbar.querySelectorAll(
@@ -843,34 +614,17 @@
     reloadImages();
   });
 
-  // ---------- Relisting search ----------
+  // ---------- Silent relisting search ----------
 
-  // Tracks property IDs we're waiting to hear back from a search tab about.
-  // Maps propertyId -> { resolve, timeoutId }.
-  const pendingRelistChecks = new Map();
+  // Keeps the site's own pre-filter loose so a genuine relisting that was
+  // remeasured doesn't get silently excluded before our own stricter matching
+  // logic ever sees it. Confirmed via live testing: a tight band excluded
+  // real relistings before they reached our matching (Snæland 2, Helluvað 13).
+  const AREA_SEARCH_TOLERANCE = 20;
 
-  window.addEventListener('message', (event) => {
-    if (event.origin !== location.origin) return;
-    const data = event.data;
-    if (!data || data.type !== 'fdhRelistResult') return;
-    const pending = pendingRelistChecks.get(data.propertyId);
-    if (pending) {
-      clearTimeout(pending.timeoutId);
-      pendingRelistChecks.delete(data.propertyId);
-      pending.resolve({
-        outcome: data.outcome,
-        newPrice: data.newPrice,
-        newIsTilbod: data.newIsTilbod,
-        savedCount: data.savedCount,
-      });
-    }
-  });
-
-  // The site's search appears not to handle a hyphenated street-number range
+  // The site's search doesn't handle a hyphenated street-number range
   // (e.g. "Langholtsvegur 122-124") - using just the part before the hyphen
-  // (e.g. "Langholtsvegur 122") finds it correctly. This only affects the
-  // search keyword; c.street itself is left untouched everywhere else
-  // (open house list, alerts, etc.) so the full address still displays.
+  // finds it correctly.
   function searchKeyword(street) {
     if (!street) return street;
     const hyphenIndex = street.indexOf('-');
@@ -878,87 +632,187 @@
     return street.slice(0, hyphenIndex).trim();
   }
 
-  // Builds a search URL. We include a broad area range (floor/ceil of the
-  // known size, as plain integers) to help the site's own search actually
-  // surface the listing, plus exact bathroom/bedroom/room counts (these are
-  // already plain integers, unlike area, so they haven't shown the same
-  // formatting problems). We still rely entirely on our own verification
-  // (isRealMatch, using the fdh* params below) to do the final, strict
-  // narrowing. fdhBulk marks a search opened from the bulk "Remove Sold"
-  // flow, so the search tab knows to close itself even on an area-mismatch
-  // finding (a single tab in that case isn't useful unattended, unlike the
-  // single-property flow where it's left open for review).
-  function buildSearchUrl(c, isBulk) {
+  // Builds a search results URL for manual review (no auto-favorite trigger).
+  // Used when area-mismatch or results-no-match needs human eyes.
+  function buildManualReviewUrl(c) {
     const hashParts = [];
     if (c.size != null) {
-      // Widened well beyond the original size (rather than a tight
-      // floor/ceil band) so the SITE'S OWN search doesn't pre-filter out a
-      // genuine relisting that's been remeasured to a meaningfully different
-      // size. Confirmed via live testing: a tight band silently excluded real
-      // relistings before they ever reached our own matching logic - Snæland
-      // 2 (92 -> 98 m²) and Helluvað 13 (99.2 -> 96.1 m²) were both wrongly
-      // reported as no-match and removed with nothing saved, because the
-      // candidate card never appeared in the site's results at all, so
-      // neither isRealMatch nor isAreaMismatchCandidate ever got a chance to
-      // see it. This widening only affects what the site hands back to filter
-      // through - isRealMatch below still requires exact size agreement
-      // before anything gets favorited, so this does NOT loosen what counts
-      // as a genuine match.
-      const AREA_SEARCH_TOLERANCE = 20;
       const areaMin = Math.max(0, Math.floor(c.size) - AREA_SEARCH_TOLERANCE);
       const areaMax = Math.ceil(c.size) + AREA_SEARCH_TOLERANCE;
       hashParts.push(`area=${areaMin},${areaMax}`);
     }
     hashParts.push('sort=price');
-    if (c.street) {
-      hashParts.push(`keyword=${encodeURIComponent(searchKeyword(c.street))}`);
-    }
+    if (c.street) hashParts.push(`keyword=${encodeURIComponent(searchKeyword(c.street))}`);
     hashParts.push('stype=sale');
     if (c.baths != null) hashParts.push(`bathroom=${c.baths},${c.baths}`);
     if (c.beds != null) hashParts.push(`bedroom=${c.beds},${c.beds}`);
     if (c.rooms != null) hashParts.push(`room=${c.rooms},${c.rooms}`);
-
-    const extra = new URLSearchParams();
-    extra.set('stype', 'sale');
-    extra.set('fdhAutoFav', '1');
-    extra.set('fdhPropId', c.id);
-    if (isBulk) extra.set('fdhBulk', '1');
-    if (c.size != null) extra.set('fdhSize', c.size);
-    if (c.rooms != null) extra.set('fdhRooms', c.rooms);
-    if (c.baths != null) extra.set('fdhBaths', c.baths);
-    if (c.beds != null) extra.set('fdhBeds', c.beds);
-
-    const base = `https://fasteignir.visir.is/search/results/?${extra.toString()}`;
-    return `${base}#/?${hashParts.join('&')}`;
+    return `https://fasteignir.visir.is/search/results/?stype=sale#/?${hashParts.join('&')}`;
   }
 
-  // Opens a search tab for this property and returns a Promise that resolves
-  // once the search tab reports its outcome (or we give up waiting). Must be
-  // called synchronously in direct response to a user click wherever
-  // possible, since window.open() is otherwise likely to be popup-blocked.
-  function triggerRelistSearch(c, isBulk) {
-    return new Promise((resolve) => {
-      const win = window.open(buildSearchUrl(c, isBulk), '_blank');
-      if (!win) {
-        resolve({ outcome: 'popup-blocked' });
-        return;
+  // Strict match: if the sold card (ref) has a value for any field, the
+  // candidate must also have that field with a matching value. A candidate
+  // that's missing data we have on the ref is rejected — we can't confirm it.
+  function isRealMatchData(ref, candidate) {
+    if (ref.size != null) {
+      if (candidate.size == null) return false;
+      if (Math.abs(candidate.size - ref.size) > 0.05) return false;
+    }
+    if (ref.rooms != null) {
+      if (candidate.rooms == null) return false;
+      if (candidate.rooms !== ref.rooms) return false;
+    }
+    if (ref.baths != null) {
+      if (candidate.baths == null) return false;
+      if (candidate.baths !== ref.baths) return false;
+    }
+    if (ref.beds != null) {
+      if (candidate.beds == null) return false;
+      if (candidate.beds !== ref.beds) return false;
+    }
+    return true;
+  }
+
+  // Area-mismatch: rooms/baths/beds all match the ref (where known), but
+  // size is confirmed different (both sides have a value that differs > 0.05).
+  // Indicates "probably the same property but the listed area changed" —
+  // needs a person to review rather than being silently saved or ignored.
+  function isAreaMismatchData(ref, candidate) {
+    if (ref.size == null || candidate.size == null) return false;
+    if (Math.abs(candidate.size - ref.size) <= 0.05) return false;
+    if (ref.rooms != null) {
+      if (candidate.rooms == null || candidate.rooms !== ref.rooms) return false;
+    }
+    if (ref.baths != null) {
+      if (candidate.baths == null || candidate.baths !== ref.baths) return false;
+    }
+    if (ref.beds != null) {
+      if (candidate.beds == null || candidate.beds !== ref.beds) return false;
+    }
+    return true;
+  }
+
+  // Calls the site's add-to-favorites endpoint directly for a known property
+  // ID. Returns 'newly-saved', 'already-saved', or 'failed'.
+  async function saveSilently(id) {
+    try {
+      const resp = await fetch(`/ajax/add_property_favorite/${id}`, {
+        credentials: 'include',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      const text = await resp.text();
+      console.log(`[Fasteignir Helper] save response for ${id} (HTTP ${resp.status}):`, text.slice(0, 300));
+      let outcome;
+      if (!resp.ok) {
+        outcome = 'failed';
+      } else if (text.includes('"success"')) {
+        outcome = 'newly-saved';
+      } else if (text.includes('"already_has"')) {
+        outcome = 'already-saved';
+      } else {
+        // Unknown response body but HTTP 200 — treat as success until we see otherwise.
+        outcome = 'newly-saved';
       }
-      const timeoutId = setTimeout(() => {
-        pendingRelistChecks.delete(c.id);
-        resolve({ outcome: 'unknown' });
-      }, 15000);
-      pendingRelistChecks.set(c.id, { resolve, timeoutId });
-    });
+      // Persist diagnostics so they survive the page reload that follows a save.
+      try {
+        const existing = JSON.parse(sessionStorage.getItem('fdh_saveDiag') || '[]');
+        existing.push({ id, httpStatus: resp.status, body: text.slice(0, 500), outcome, ts: new Date().toISOString() });
+        sessionStorage.setItem('fdh_saveDiag', JSON.stringify(existing));
+      } catch (_) {}
+      return outcome;
+    } catch (e) {
+      console.error(`[Fasteignir Helper] save error for ${id}:`, e);
+      return 'failed';
+    }
   }
+
+  // Searches silently for a relisting of the sold card c. Returns:
+  //   'no-match'         — search returned no results → safe to remove
+  //   'favorited'        — found exact match(es), saved them → safe to remove
+  //   'area-mismatch'    — results found, size differs → leave in place, open tab
+  //   'results-no-match' — results found but nothing matched → leave, open tab
+  //   'save-failed'      — found a match but save endpoint failed → leave in place
+  //   'error'            — network/parse failure → leave in place
+  async function silentRelistSearch(c) {
+    const params = new URLSearchParams({ stype: 'sale' });
+    if (c.street) params.set('keyword', searchKeyword(c.street));
+    if (c.size != null) {
+      const areaMin = Math.max(0, Math.floor(c.size) - AREA_SEARCH_TOLERANCE);
+      const areaMax = Math.ceil(c.size) + AREA_SEARCH_TOLERANCE;
+      params.set('area', `${areaMin},${areaMax}`);
+    }
+    const searchUrl = `/ajaxsearch/getresults?${params.toString()}`;
+    console.log(`[Fasteignir Helper] silent search for ${c.id} (${c.street}): ${searchUrl}`);
+
+    let html;
+    try {
+      const resp = await fetch(searchUrl, {
+        headers: { 'Accept': 'text/html, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest' },
+        credentials: 'include',
+      });
+      html = await resp.text();
+    } catch (e) {
+      console.error('[Fasteignir Helper] search fetch error:', e);
+      return { outcome: 'error' };
+    }
+
+    if (/Leitin skilaði engum niðurstöðum/i.test(html)) {
+      console.log(`[Fasteignir Helper] no results for ${c.id}`);
+      return { outcome: 'no-match' };
+    }
+
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const cardEls = Array.from(doc.querySelectorAll('.estate__item[data-id]'));
+
+    if (cardEls.length === 0) {
+      // Got a non-empty response that doesn't look like cards — could be a
+      // changed site structure. Treat as ambiguous and flag for manual review.
+      console.warn(`[Fasteignir Helper] got HTML for ${c.id} but found no card elements`);
+      return { outcome: 'results-no-match' };
+    }
+
+    const candidates = cardEls.map(parseCard);
+    console.log(`[Fasteignir Helper] ${candidates.length} card(s) returned:`, candidates.map(cd => `${cd.id} ${cd.street} ${cd.size}m² ${cd.rooms}r`));
+
+    const exactMatches = candidates.filter((cd) => isRealMatchData(c, cd));
+
+    if (exactMatches.length > 0) {
+      console.log(`[Fasteignir Helper] exact match(es):`, exactMatches.map(cd => cd.id));
+      const confirmedIds = new Set();
+      let newPrice = null;
+      let newIsTilbod = false;
+      for (const match of exactMatches) {
+        const saveResult = await saveSilently(match.id);
+        if (saveResult === 'newly-saved' || saveResult === 'already-saved') {
+          confirmedIds.add(match.id);
+          if (newPrice == null) {
+            newPrice = match.price;
+            newIsTilbod = match.isTilbod;
+          }
+        }
+      }
+      if (confirmedIds.size > 0) {
+        return { outcome: 'favorited', newPrice, newIsTilbod, savedCount: confirmedIds.size };
+      }
+      return { outcome: 'save-failed' };
+    }
+
+    const areaMismatches = candidates.filter((cd) => isAreaMismatchData(c, cd));
+    if (areaMismatches.length > 0) {
+      console.log(`[Fasteignir Helper] area mismatch for ${c.id}:`, areaMismatches.map(cd => `${cd.id} size=${cd.size}`));
+      return { outcome: 'area-mismatch' };
+    }
+
+    console.log(`[Fasteignir Helper] results found but none matched ${c.id}`);
+    return { outcome: 'results-no-match' };
+  }
+
+  // ---------- Property matching helpers ----------
 
   // Same address and EXACTLY matching size/rooms/bathrooms/bedrooms where
   // both sides have a value. No tolerance on size - two real, different
-  // nearby-sized units (e.g. 96.1 vs 96.4) must never be treated as the
-  // same property just because they're close. The trade-off: if a
-  // relisting's size happens to get rounded AND you already have both the
-  // old and new entries saved, this won't catch that locally - but a real
-  // search will still resolve it correctly (the site will say "already
-  // saved" once it finds the active one), just slightly less efficiently.
+  // nearby-sized units must never be treated as the same property just because
+  // they're close.
   function isSameProperty(a, b) {
     if (!a.street || !b.street) return false;
     if (a.street.trim().toLowerCase() !== b.street.trim().toLowerCase()) return false;
@@ -970,15 +824,13 @@
   }
 
   // If a still-active saved property already matches this sold one, the
-  // relisting is effectively already saved - no need to spend a search tab
-  // confirming that.
+  // relisting is effectively already saved - no need to spend a search on it.
   function findActiveDuplicate(c) {
     return cards.find((other) => other.id !== c.id && other.status === 'active' && isSameProperty(other, c));
   }
 
   // Other saved entries for this same property that are themselves sold -
-  // these are stale duplicates that should be cleaned up alongside c once we
-  // know an active entry for the property already exists.
+  // stale duplicates to clean up alongside c once we know an active entry exists.
   function findSoldDuplicates(c) {
     return cards.filter(
       (other) =>
@@ -998,31 +850,24 @@
     if (closeBtn) closeBtn.click();
   }
 
-  // Resolves a property's relisting outcome. If a still-active duplicate is
-  // already saved, skips the search entirely and reports it as saved.
-  function resolveRelisting(c, isBulk) {
+  // If a still-active duplicate is already saved, skip the search entirely.
+  // Otherwise do a silent search.
+  function resolveRelisting(c) {
     const dup = findActiveDuplicate(c);
     if (dup) {
       return Promise.resolve({ outcome: 'already-saved-locally', newPrice: dup.price, newIsTilbod: dup.isTilbod });
     }
-    return triggerRelistSearch(c, isBulk);
+    return silentRelistSearch(c);
   }
 
   // Resolves c's relisting outcome and, once it's definite, removes c and
-  // any other stale sold duplicates of the same property too - whatever the
-  // answer is (relisted and saved, already saved, or confirmed not
-  // relisted), it applies equally to every saved entry for that physical
-  // property, not just whichever one happened to trigger the check. An
-  // "area mismatch" outcome is deliberately NOT treated as definite - that
-  // needs a person to look at it, so nothing gets removed for it. Any
-  // unexpected error resolving the outcome is caught here so one property's
-  // failure can never take down a whole bulk batch's summary/reload step.
-  // resolveFn defaults to resolveRelisting but can be swapped for a deduped
-  // version when processing many properties at once.
+  // any other stale sold duplicates of the same property too. An
+  // "area-mismatch" or "results-no-match" outcome is deliberately NOT treated
+  // as definite — that needs a person to look at it, so nothing gets removed.
   async function processSoldProperty(c, resolveFn) {
     let result;
     try {
-      result = await (resolveFn ? resolveFn(c) : resolveRelisting(c, false));
+      result = await (resolveFn ? resolveFn(c) : resolveRelisting(c));
     } catch (err) {
       console.error('[Fasteignir Helper] error resolving relisting for', c.id, err);
       return { outcome: 'error' };
@@ -1035,8 +880,7 @@
       removeSavedProperty(c);
       findSoldDuplicates(c).forEach(removeSavedProperty);
       // Keep the cache in sync with this removal immediately, so a later
-      // soft-refresh (triggered by some other property entirely) doesn't
-      // restore a stale status for something that's already been handled.
+      // soft-refresh doesn't restore a stale status for something already handled.
       saveStatusCache();
     }
     return result;
@@ -1054,9 +898,7 @@
   }
 
   // Builds a "NOW PRICED AT X (was Y)" / "NOW LISTED AS TILBOÐ (was Y)" line,
-  // or null if the price (or Tilboð status) is unchanged. Deliberately states
-  // old vs new rather than computing increase/decrease - that's trivial for
-  // the person to work out themselves from the two values.
+  // or null if the price (or Tilboð status) is unchanged.
   function priceChangeLine(oldPrice, oldIsTilbod, newPrice, newIsTilbod) {
     const oldDisplay = formatPriceDisplay(oldPrice, oldIsTilbod);
     const newDisplay = formatPriceDisplay(newPrice, newIsTilbod);
@@ -1081,11 +923,8 @@
     badge.textContent = label;
   }
 
-  // A per-property button shown only on flagged (no-longer-valid) cards.
-  // Clicking it removes that one property and searches for a relisting,
-  // reporting the outcome once the search tab finishes. Every message is
-  // prefixed with the property's address, since this can be triggered on
-  // several different cards in quick succession.
+  // A per-property button shown on flagged (no-longer-valid) cards. Clicking
+  // it searches silently for a relisting and reports the outcome.
   function addRemoveSearchButton(c) {
     if (c.el.querySelector('.fdh-remove-search-btn')) return;
     const btn = document.createElement('button');
@@ -1103,13 +942,6 @@
       e.stopPropagation();
       btn.disabled = true;
       btn.textContent = 'Searching...';
-      // Note: only opens a search tab (when resolveRelisting doesn't find a
-      // local duplicate) synchronously, in direct response to this click, so
-      // window.open() isn't treated as an unsolicited popup. We deliberately
-      // wait for a definite outcome before removing the sold card itself -
-      // removing it unconditionally would risk losing track of the property
-      // entirely if the search comes back uncertain (e.g. popup-blocked or
-      // the tab closes without reporting back) and no relisting got saved.
       const result = await processSoldProperty(c);
       if (c._removed) {
         btn.textContent = 'Removed';
@@ -1123,10 +955,8 @@
         const priceLine = priceChangeLine(c.price, c.isTilbod, result.newPrice, !!result.newIsTilbod);
         if (priceLine) msg += '\n' + priceLine;
         alert(msg);
-        // A reload is only needed here - the new relisting was favorited in
-        // a separate tab, so this page's own DOM has no way to know about
-        // it otherwise. Uses the cache, so this doesn't re-check every other
-        // property, only whatever's new.
+        // A reload is needed — the new relisting was favorited via fetch, so
+        // this page's DOM has no way to know about it otherwise.
         reloadUsingCache();
       } else if (result.outcome === 'already-saved-locally') {
         let msg = `${c.street}: An active listing for this property was already in your saved properties.`;
@@ -1140,16 +970,17 @@
         applyFilter();
         renderOpenHouses();
       } else if (result.outcome === 'area-mismatch') {
-        alert(
-          `${c.street}: No new listing was found.\nNOTE: Another listing was found with a different floor area - the search tab has been left open so you can take a look.`
-        );
-        // Not removed - left in place for manual review, search tab stays open.
-      } else if (result.outcome === 'popup-blocked') {
-        alert(`${c.street}: Could not open a search tab - please allow popups for this site. The property was not removed - you can try again.`);
+        window.open(buildManualReviewUrl(c));
+        alert(`${c.street}: No exact match found.\nNOTE: A listing at that address with a different floor area was found — a search tab has been opened for manual review.`);
+      } else if (result.outcome === 'results-no-match') {
+        window.open(buildManualReviewUrl(c));
+        alert(`${c.street}: Listings were found for that address but none matched this property's details — a search tab has been opened for manual review.`);
+      } else if (result.outcome === 'save-failed') {
+        alert(`${c.street}: A matching relisting was found but could not be saved automatically. Please check manually.`);
       } else if (result.outcome === 'error') {
-        alert(`${c.street}: Something went wrong while checking this property. The property was not removed - you can try again.`);
+        alert(`${c.street}: Something went wrong while checking this property. It was not removed — you can try again.`);
       } else {
-        alert(`${c.street}: Could not confirm the search result, so the property was not removed. You can try again.`);
+        alert(`${c.street}: Could not confirm the outcome, so the property was not removed. You can try again.`);
       }
     });
   }
@@ -1239,17 +1070,17 @@
 
   async function checkAll() {
     const toCheck = cards.filter((c) => c.status !== 'sold-address');
-    const batchSize = 12;
-    let done = 0;
+    const batchSize = 20;
     setFilterControlsDisabled(true);
     try {
-      applyFilter('(checking statuses...)');
+      statusLine('Checking...');
+      let done = 0;
       for (let i = 0; i < toCheck.length; i += batchSize) {
         const batch = toCheck.slice(i, i + batchSize);
         await Promise.all(batch.map((c) => checkOne(c)));
         done += batch.length;
-        statusLine(`Checked ${done} of ${toCheck.length}...`);
-        await new Promise((r) => setTimeout(r, 50)); // light pacing without making the initial check drag
+        statusLine(`Checking: ${done} of ${toCheck.length}...`);
+        await new Promise((r) => setTimeout(r, 20));
       }
       applyFilter();
       saveStatusCache();
@@ -1311,6 +1142,15 @@
     location.reload();
   }
 
+  // On load after a reload-from-save, print any persisted save diagnostics to console.
+  try {
+    const diag = sessionStorage.getItem('fdh_saveDiag');
+    if (diag) {
+      sessionStorage.removeItem('fdh_saveDiag');
+      console.log('[Fasteignir Helper] Save diagnostics from before reload:', JSON.parse(diag));
+    }
+  } catch (_) {}
+
   async function runInitialCheck() {
     let skip = false;
     try {
@@ -1370,21 +1210,20 @@
     ) {
       return;
     }
-    // Two or more sold entries can represent the same physical property
-    // (e.g. it was saved more than once over time, or relisted once before
-    // and went stale again). Searching for each separately would be
-    // redundant and risks the later ones getting popup-blocked - instead,
-    // entries that match each other share a single search outcome.
+
+    // Deduplicate: multiple sold entries for the same physical property share
+    // a single silent search outcome.
     const relistOutcomeCache = new Map();
     function propertyKey(c) {
       return `${(c.street || '').trim().toLowerCase()}|${c.size}|${c.rooms}|${c.baths}|${c.beds}`;
     }
     function resolveRelistingDeduped(c) {
       const key = propertyKey(c);
-      if (relistOutcomeCache.has(key)) {
-        return relistOutcomeCache.get(key);
-      }
-      const p = resolveRelisting(c, true); // isBulk = true
+      if (relistOutcomeCache.has(key)) return relistOutcomeCache.get(key);
+      const dup = findActiveDuplicate(c);
+      const p = dup
+        ? Promise.resolve({ outcome: 'already-saved-locally', newPrice: dup.price, newIsTilbod: dup.isTilbod })
+        : silentRelistSearch(c);
       relistOutcomeCache.set(key, p);
       return p;
     }
@@ -1392,24 +1231,23 @@
     const resultPromises = [];
     const priceChanges = [];
     const areaMismatchAddresses = [];
+    const resultsNoMatchAddresses = [];
+
     for (const c of toRemove) {
       if (c._removed) continue; // already cleaned up as another property's sold duplicate
-      // Checks for a local duplicate first (no tab needed if found). Note:
-      // only the first one or two calls in this loop that actually need to
-      // open a tab are likely to avoid the browser's popup blocker, since
-      // each subsequent one happens after an awaited delay, outside the
-      // original click's gesture window - allow popups for this site to
-      // avoid missing relistings later in the batch. Removal of c (and any
-      // other sold duplicates of the same property) is handled inside
-      // processSoldProperty, and only once the outcome is definite - removing
-      // unconditionally would risk losing track of the property entirely if
-      // the search comes back uncertain and no relisting got saved.
+      // Removal of c (and any other sold duplicates of the same property) is
+      // handled inside processSoldProperty, and only once the outcome is
+      // definite - removing unconditionally would risk losing track of the
+      // property entirely if the search comes back uncertain and no relisting
+      // got saved.
       const resultPromise = processSoldProperty(c, resolveRelistingDeduped).then((result) => {
         if (!c._removed) {
           if (result.outcome === 'area-mismatch') {
             areaMismatchAddresses.push(c.street);
+          } else if (result.outcome === 'results-no-match') {
+            resultsNoMatchAddresses.push(c.street);
           } else {
-            console.warn('[Fasteignir Helper] leaving', c.id, 'in place - uncertain relisting outcome:', result.outcome);
+            console.warn('[Fasteignir Helper] leaving', c.id, 'in place - outcome:', result.outcome);
           }
         } else if (result.outcome === 'favorited' || result.outcome === 'already-saved-locally') {
           const line = priceChangeLine(c.price, c.isTilbod, result.newPrice, !!result.newIsTilbod);
@@ -1418,11 +1256,13 @@
         return result;
       });
       resultPromises.push(resultPromise);
-      // small delay so the site's own AJAX call has time to fire before the next one
+      // Small delay between searches so we don't hammer the server.
       await new Promise((r) => setTimeout(r, 600));
     }
-    statusLine(`Waiting on relisting searches for ${resultPromises.length} propert${resultPromises.length === 1 ? 'y' : 'ies'}...`);
+
+    statusLine(`Waiting on silent searches for ${resultPromises.length} propert${resultPromises.length === 1 ? 'y' : 'ies'}...`);
     const outcomes = await Promise.all(resultPromises);
+
     const favoritedCount = outcomes.reduce(
       (sum, o) => sum + (o.outcome === 'favorited' ? o.savedCount || 1 : 0),
       0
@@ -1433,25 +1273,30 @@
     // duplicate never gets its own entry in outcomes.
     const removedCount = toRemove.filter((c) => c._removed).length;
     const uncertainCount = toRemove.length - removedCount;
+
     let message = `Removed ${removedCount} sold propert${removedCount === 1 ? 'y' : 'ies'}. ${favoritedCount} relisting${favoritedCount === 1 ? '' : 's'} found and saved.`;
     if (alreadySavedCount > 0) {
       message += ` ${alreadySavedCount} already had an active listing saved.`;
     }
     if (uncertainCount > 0) {
-      message += ` ${uncertainCount} could not be confirmed and ${uncertainCount === 1 ? 'was' : 'were'} left in your saved list - please check manually.`;
+      message += ` ${uncertainCount} could not be confirmed and ${uncertainCount === 1 ? 'was' : 'were'} left in your saved list — please check manually.`;
     }
     if (priceChanges.length > 0) {
       message += `\nPrice changes:\n${priceChanges.join('\n')}`;
     }
     if (areaMismatchAddresses.length > 0) {
-      message += `\nNOTE: A listing with a different floor area was found for: ${areaMismatchAddresses.join(', ')}`;
+      message += `\nNOTE — different floor area found (manual review needed): ${areaMismatchAddresses.join(', ')}`;
     }
+    if (resultsNoMatchAddresses.length > 0) {
+      message += `\nNOTE — results found but no detail match (manual review needed): ${resultsNoMatchAddresses.join(', ')}`;
+    }
+
     alert(message);
+
     if (favoritedCount > 0) {
       // A reload is only needed when something new was actually favorited -
-      // that happened in a separate tab, so this page has no way to know
-      // about it otherwise. Uses the cache, so this doesn't re-check
-      // everyone else, only whatever's new.
+      // that happened via fetch, so this page has no way to know about it
+      // otherwise. Uses the cache, so this doesn't re-check everyone else.
       reloadUsingCache();
     } else {
       applyFilter();
