@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.12
+// @version      3.13
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @updateURL    https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-dashboard-helper.user.js
@@ -1233,14 +1233,33 @@
     const areaMismatchAddresses = [];
     const resultsNoMatchAddresses = [];
 
+    // Live counters for rolling status updates
+    let queued = 0;
+    let completed = 0;
+    let relistingsSaved = 0;
+    let alreadySavedLive = 0;
+    const total = toRemove.filter((c) => !c._removed).length;
+
+    function updateStatus() {
+      const parts = [`Removing sold: ${queued}/${total}`];
+      if (completed > 0) parts.push(`${completed} done`);
+      if (relistingsSaved > 0) parts.push(`${relistingsSaved} relisting${relistingsSaved === 1 ? '' : 's'} saved`);
+      if (alreadySavedLive > 0) parts.push(`${alreadySavedLive} already active`);
+      statusLine(parts.join(' — ') + '...');
+    }
+
     for (const c of toRemove) {
       if (c._removed) continue; // already cleaned up as another property's sold duplicate
+      queued++;
+      statusLine(`Removing sold (${queued}/${total}): ${c.street}...`);
+
       // Removal of c (and any other sold duplicates of the same property) is
       // handled inside processSoldProperty, and only once the outcome is
       // definite - removing unconditionally would risk losing track of the
       // property entirely if the search comes back uncertain and no relisting
       // got saved.
       const resultPromise = processSoldProperty(c, resolveRelistingDeduped).then((result) => {
+        completed++;
         if (!c._removed) {
           if (result.outcome === 'area-mismatch') {
             areaMismatchAddresses.push(c.street);
@@ -1252,7 +1271,10 @@
         } else if (result.outcome === 'favorited' || result.outcome === 'already-saved-locally') {
           const line = priceChangeLine(c.price, c.isTilbod, result.newPrice, !!result.newIsTilbod);
           if (line) priceChanges.push(`${c.street}: ${line}`);
+          if (result.outcome === 'favorited') relistingsSaved += result.savedCount || 1;
+          if (result.outcome === 'already-saved-locally') alreadySavedLive++;
         }
+        updateStatus();
         return result;
       });
       resultPromises.push(resultPromise);
@@ -1260,7 +1282,7 @@
       await new Promise((r) => setTimeout(r, 600));
     }
 
-    statusLine(`Waiting on silent searches for ${resultPromises.length} propert${resultPromises.length === 1 ? 'y' : 'ies'}...`);
+    statusLine(`Finishing up — ${resultPromises.length} search${resultPromises.length === 1 ? '' : 'es'} in flight...`);
     const outcomes = await Promise.all(resultPromises);
 
     const favoritedCount = outcomes.reduce(
