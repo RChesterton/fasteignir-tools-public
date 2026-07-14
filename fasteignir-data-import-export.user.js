@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir Data Import/Export
 // @namespace    fasteignir-tools
-// @version      0.27
+// @version      0.28
 // @description  Import/export saved-property and ISP data, and sync temporary search exclusions
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -1308,8 +1308,11 @@
     }
 
     function scheduleFiltering() {
-      clearTimeout(applyTimer);
-      applyTimer = setTimeout(applyFiltering, 80);
+      if (applyTimer !== null) return;
+      applyTimer = setTimeout(() => {
+        applyTimer = null;
+        applyFiltering();
+      }, 80);
     }
 
     async function loadHiddenListings() {
