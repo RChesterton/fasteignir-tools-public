@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.14
+// @version      3.15
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -69,7 +69,7 @@
     }
 
     function findResultCountEl() {
-      const resultCountPattern = /^\d+\s+eignir\s+fundust$/i;
+      const resultCountPattern = /^\d+\s*eignir\s+fundust$/i;
       const candidates = Array.from(document.querySelectorAll('h1, h2, h3, h4, div, span, p'));
       return candidates.find((el) => {
         if (!resultCountPattern.test((el.textContent || '').trim())) return false;
@@ -104,9 +104,21 @@
       return { wrap, status };
     }
 
-    function setSearchStatus(message) {
+    function setSearchStatus(message, href = null) {
       const controls = ensureSearchControls();
-      if (controls) controls.status.textContent = message || '';
+      if (!controls) return;
+
+      controls.status.textContent = '';
+      if (!message) return;
+
+      if (href) {
+        const link = document.createElement('a');
+        link.href = href;
+        link.textContent = message;
+        controls.status.appendChild(link);
+      } else {
+        controls.status.textContent = message;
+      }
     }
 
     function applySearchFiltering() {
@@ -193,10 +205,11 @@
         setSearchStatus('');
       } catch (error) {
         savedPropertyIds = null;
-        const message = error && error.message === 'not logged in'
+        const isLoggedOut = error && error.message === 'not logged in';
+        const message = isLoggedOut
           ? 'Sign in to hide saved properties.'
           : 'Saved-property check unavailable.';
-        setSearchStatus(message);
+        setSearchStatus(message, isLoggedOut ? '/user/dashboard' : null);
         console.warn('[Fasteignir Helper] could not load saved properties:', error);
       }
       applySearchFiltering();
