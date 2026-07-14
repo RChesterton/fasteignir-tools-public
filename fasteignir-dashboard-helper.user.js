@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.13
+// @version      3.14
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
+// @match        https://fasteignir.visir.is/search/results*
 // @updateURL    https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-dashboard-helper.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-dashboard-helper.user.js
 // @grant        none
@@ -12,6 +13,207 @@
 
 (function () {
   'use strict';
+
+  // ---------- Search results: hide adverts and already-saved properties ----------
+
+  function initSearchResultsCleaner() {
+    const HIDDEN_AD_CLASS = 'fdh-search-hidden-ad';
+    const HIDDEN_SAVED_CLASS = 'fdh-search-hidden-saved';
+    let savedPropertyIds = null;
+    let showSaved = false;
+    let applyTimer = null;
+
+    const searchStyle = document.createElement('style');
+    searchStyle.textContent = `
+      .${HIDDEN_AD_CLASS}, .${HIDDEN_SAVED_CLASS} { display: none !important; }
+      #fdh-show-saved-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-left: 16px;
+        color: #333;
+        font-size: 14px;
+        font-weight: normal;
+        white-space: nowrap;
+      }
+      #fdh-show-saved-wrap input { margin: 0; }
+      #fdh-search-status {
+        margin-left: 16px;
+        color: #a33;
+        font-size: 13px;
+        font-weight: normal;
+      }
+    `;
+    document.head.appendChild(searchStyle);
+
+    function canonicalPropertyId(card) {
+      const links = [];
+      if (card.matches('a[href]')) links.push(card);
+      links.push(...card.querySelectorAll('a[href]'));
+
+      for (const link of links) {
+        try {
+          const url = new URL(link.getAttribute('href'), location.href);
+          if (url.origin !== location.origin) continue;
+          const match = url.pathname.match(/^\/property\/(\d+)\/?$/);
+          if (match) return match[1];
+        } catch (_) {}
+      }
+      return null;
+    }
+
+    function topLevelResultCards() {
+      return Array.from(document.querySelectorAll('.estate__item')).filter(
+        (card) => !card.parentElement || !card.parentElement.closest('.estate__item')
+      );
+    }
+
+    function findResultCountEl() {
+      const resultCountPattern = /^\d+\s+eignir\s+fundust$/i;
+      const candidates = Array.from(document.querySelectorAll('h1, h2, h3, h4, div, span, p'));
+      return candidates.find((el) => {
+        if (!resultCountPattern.test((el.textContent || '').trim())) return false;
+        return !Array.from(el.children).some((child) =>
+          resultCountPattern.test((child.textContent || '').trim())
+        );
+      }) || null;
+    }
+
+    function ensureSearchControls() {
+      const countEl = findResultCountEl();
+      if (!countEl) return null;
+
+      let wrap = document.getElementById('fdh-show-saved-wrap');
+      if (!wrap) {
+        wrap = document.createElement('label');
+        wrap.id = 'fdh-show-saved-wrap';
+        wrap.innerHTML = '<input id="fdh-show-saved" type="checkbox"><span></span>';
+        countEl.insertAdjacentElement('afterend', wrap);
+        wrap.querySelector('input').addEventListener('change', (event) => {
+          showSaved = event.target.checked;
+          applySearchFiltering();
+        });
+      }
+
+      let status = document.getElementById('fdh-search-status');
+      if (!status) {
+        status = document.createElement('span');
+        status.id = 'fdh-search-status';
+        wrap.insertAdjacentElement('afterend', status);
+      }
+      return { wrap, status };
+    }
+
+    function setSearchStatus(message) {
+      const controls = ensureSearchControls();
+      if (controls) controls.status.textContent = message || '';
+    }
+
+    function applySearchFiltering() {
+      const cards = topLevelResultCards();
+      const savedMatchIds = new Set();
+
+      for (const card of cards) {
+        card.classList.remove(HIDDEN_AD_CLASS, HIDDEN_SAVED_CLASS);
+
+        // These are promoted developments/properties placed ahead of the
+        // normal results, even when they contain a property-looking link.
+        if (card.classList.contains('wide-item-desktop')) {
+          card.classList.add(HIDDEN_AD_CLASS);
+          continue;
+        }
+
+        const linkId = canonicalPropertyId(card);
+        if (!linkId) {
+          card.classList.add(HIDDEN_AD_CLASS);
+          continue;
+        }
+
+        const dataId = card.dataset.id ? String(card.dataset.id) : null;
+        const confirmedId = !dataId || dataId === linkId ? linkId : null;
+        if (dataId && dataId !== linkId) {
+          console.warn('[Fasteignir Helper] result card ID/link mismatch; leaving it visible:', {
+            dataId,
+            linkId,
+          });
+        }
+
+        if (confirmedId && savedPropertyIds && savedPropertyIds.has(confirmedId)) {
+          savedMatchIds.add(confirmedId);
+          if (!showSaved) card.classList.add(HIDDEN_SAVED_CLASS);
+        }
+      }
+
+      const controls = ensureSearchControls();
+      if (controls) {
+        const savedMatchCount = savedMatchIds.size;
+        const checkbox = controls.wrap.querySelector('input');
+        const label = controls.wrap.querySelector('span');
+        checkbox.checked = showSaved;
+        label.textContent = `Show Saved (${savedMatchCount})`;
+        controls.wrap.style.display = savedPropertyIds && savedMatchCount > 0 ? 'inline-flex' : 'none';
+      }
+    }
+
+    function scheduleFiltering() {
+      clearTimeout(applyTimer);
+      applyTimer = setTimeout(applySearchFiltering, 80);
+    }
+
+    async function loadSavedPropertyIds() {
+      try {
+        const response = await fetch('/user/dashboard', {
+          credentials: 'include',
+          headers: { Accept: 'text/html,application/xhtml+xml' },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const responseUrl = new URL(response.url, location.href);
+        const html = await response.text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const looksLoggedOut =
+          !responseUrl.pathname.startsWith('/user/dashboard') ||
+          Boolean(doc.querySelector('input[type="password"], form[action*="login" i]'));
+        if (looksLoggedOut) throw new Error('not logged in');
+
+        const ids = new Set();
+        for (const card of doc.querySelectorAll('.estate__item[data-id]')) {
+          const id = String(card.dataset.id || '').trim();
+          if (id) ids.add(id);
+        }
+        for (const link of doc.querySelectorAll('a[href*="/property/"]')) {
+          try {
+            const url = new URL(link.getAttribute('href'), responseUrl);
+            const match = url.pathname.match(/^\/property\/(\d+)\/?$/);
+            if (url.origin === location.origin && match) ids.add(match[1]);
+          } catch (_) {}
+        }
+
+        savedPropertyIds = ids;
+        setSearchStatus('');
+      } catch (error) {
+        savedPropertyIds = null;
+        const message = error && error.message === 'not logged in'
+          ? 'Sign in to hide saved properties.'
+          : 'Saved-property check unavailable.';
+        setSearchStatus(message);
+        console.warn('[Fasteignir Helper] could not load saved properties:', error);
+      }
+      applySearchFiltering();
+    }
+
+    applySearchFiltering();
+    loadSavedPropertyIds();
+    new MutationObserver(scheduleFiltering).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  if (location.pathname.startsWith('/search/results')) {
+    initSearchResultsCleaner();
+    return;
+  }
 
   // ---------- Suppress the native "deleted" confirmation popup ----------
   // Clicking the "x" triggers the site's own removal handler, which calls a
