@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.16
+// @version      3.17
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -176,14 +176,18 @@
         const checkbox = controls.wrap.querySelector('input');
         const label = controls.wrap.querySelector('span');
         checkbox.checked = showSaved;
-        label.textContent = `Show Saved (${savedMatchCount})`;
+        const labelText = `Show Saved (${savedMatchCount})`;
+        if (label.textContent !== labelText) label.textContent = labelText;
         controls.wrap.style.display = savedPropertyIds && savedMatchCount > 0 ? 'inline-flex' : 'none';
       }
     }
 
     function scheduleFiltering() {
-      clearTimeout(applyTimer);
-      applyTimer = setTimeout(applySearchFiltering, 80);
+      if (applyTimer !== null) return;
+      applyTimer = setTimeout(() => {
+        applyTimer = null;
+        applySearchFiltering();
+      }, 80);
     }
 
     async function loadSavedPropertyIds() {
