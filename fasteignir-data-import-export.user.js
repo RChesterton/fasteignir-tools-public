@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Fasteignir Data Import/Export
 // @namespace    fasteignir-tools
-// @version      0.26
-// @description  Import, preview, and export saved-property and ISP data from your fasteignir dashboard
+// @version      0.27
+// @description  Import/export saved-property and ISP data, and sync temporary search exclusions
 // @match        https://fasteignir.visir.is/user/dashboard*
+// @match        https://fasteignir.visir.is/search/results*
 // @updateURL    https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-data-import-export.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-data-import-export.user.js
 // @grant        GM_xmlhttpRequest
@@ -335,6 +336,13 @@
   property but the current asking price differs, the export now keeps the
   previous price, current price, change timestamp, and a simple seen-price
   history rather than silently replacing the old value.
+*/
+
+/*
+  v0.27 — search-result listings can be hidden for 30 days by exact listing ID.
+  The exclusion list is stored in the existing Gist so it follows the user
+  across configured browsers and devices. Relistings with a different ID are
+  unaffected. Manual early restoration is deferred to a later version.
 */
 
 (function () {
@@ -1060,6 +1068,283 @@
 
   async function fetchExistingGistProperties() {
     return fetchExistingGistFileJson(PROPERTY_LIST_GIST_FILENAME, []);
+  }
+
+  // ---- Search results: 30-day, cross-device listing exclusions ----
+  const HIDDEN_LISTINGS_GIST_FILENAME = 'fasteignir-hidden-search-listings.json';
+  const HIDDEN_LISTING_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+  function normalizeHiddenListingRows(value) {
+    const rows = Array.isArray(value)
+      ? value
+      : value && Array.isArray(value.listings)
+        ? value.listings
+        : [];
+    const now = Date.now();
+    const active = new Map();
+    let expiredCount = 0;
+
+    for (const row of rows) {
+      const propertyId = String(row && row.propertyId || '').trim();
+      const hiddenUntilMs = Date.parse(row && row.hiddenUntil || '');
+      if (!/^\d+$/.test(propertyId) || !Number.isFinite(hiddenUntilMs)) continue;
+      if (hiddenUntilMs <= now) {
+        expiredCount++;
+        continue;
+      }
+      active.set(propertyId, {
+        propertyId,
+        hiddenAt: row.hiddenAt || new Date(now).toISOString(),
+        hiddenUntil: new Date(hiddenUntilMs).toISOString(),
+      });
+    }
+    return { active, expiredCount };
+  }
+
+  async function fetchHiddenListingRows() {
+    const token = await GM_getValue('fic_github_token', null);
+    const gistId = await getGistId();
+    if (!token || !gistId) throw new Error('Gist token or ID is not configured');
+
+    const res = await gmRequest({
+      method: 'GET',
+      url: `https://api.github.com/gists/${gistId}`,
+      headers: {
+        Authorization: 'token ' + token,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+      timeout: 15000,
+    });
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`GitHub API returned ${res.status}`);
+    }
+
+    const json = JSON.parse(res.responseText);
+    const file = json.files && json.files[HIDDEN_LISTINGS_GIST_FILENAME];
+    if (!file || !file.content) return [];
+    const parsed = JSON.parse(file.content);
+    return Array.isArray(parsed) ? parsed : parsed.listings || [];
+  }
+
+  function hiddenListingRowsFromMap(map) {
+    return Array.from(map.values()).sort((a, b) => a.propertyId.localeCompare(b.propertyId));
+  }
+
+  async function writeHiddenListingRows(map) {
+    const token = await GM_getValue('fic_github_token', null);
+    const gistId = await getGistId();
+    if (!token || !gistId) throw new Error('Gist token or ID is not configured');
+
+    const res = await gmRequest({
+      method: 'PATCH',
+      url: `https://api.github.com/gists/${gistId}`,
+      headers: {
+        Authorization: 'token ' + token,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/json',
+      },
+      data: JSON.stringify({
+        files: {
+          [HIDDEN_LISTINGS_GIST_FILENAME]: {
+            content: JSON.stringify(hiddenListingRowsFromMap(map), null, 2),
+          },
+        },
+      }),
+      timeout: 15000,
+    });
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`GitHub API returned ${res.status}`);
+    }
+  }
+
+  function initHiddenSearchListings() {
+    const HIDDEN_CLASS = 'fie-search-hidden-listing';
+    let hiddenListings = new Map();
+    let hiddenListingsReady = false;
+    let applyTimer = null;
+    let syncQueue = Promise.resolve();
+    let statusMessage = '';
+
+    const style = document.createElement('style');
+    style.textContent = `
+      .${HIDDEN_CLASS} { display: none !important; }
+      .fie-hide-button-host { position: relative !important; padding-right: 44px !important; }
+      .fie-hide-listing-button {
+        position: absolute; top: 10px; right: 10px; z-index: 5;
+        width: 24px; height: 24px; padding: 0; border: 0; border-radius: 50%;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: #d8d8d8; color: #c62828; cursor: pointer;
+        font: bold 20px/1 Arial, sans-serif;
+      }
+      .fie-hide-listing-button:hover { background: #c7c7c7; color: #a91515; }
+      .fie-hide-listing-button:disabled { cursor: wait; opacity: 0.65; }
+      #fie-hidden-status {
+        margin-left: 16px; color: #a33; font-size: 13px; font-weight: normal;
+      }
+    `;
+    document.head.appendChild(style);
+
+    function canonicalPropertyId(card) {
+      const links = [];
+      if (card.matches('a[href]')) links.push(card);
+      links.push(...card.querySelectorAll('a[href]'));
+      for (const link of links) {
+        try {
+          const url = new URL(link.getAttribute('href'), location.href);
+          const match = url.pathname.match(/^\/property\/(\d+)\/?$/);
+          if (url.origin === location.origin && match) return match[1];
+        } catch (_) {}
+      }
+      return null;
+    }
+
+    function resultCards() {
+      return Array.from(document.querySelectorAll('.estate__item')).filter(
+        (card) => !card.parentElement || !card.parentElement.closest('.estate__item')
+      );
+    }
+
+    function findResultCountEl() {
+      const pattern = /^\d+\s*eignir\s+fundust$/i;
+      return Array.from(document.querySelectorAll('h1, h2, h3, h4')).find(
+        (el) => pattern.test((el.textContent || '').trim())
+      ) || null;
+    }
+
+    function ensureStatus() {
+      const countEl = findResultCountEl();
+      if (!countEl) return null;
+
+      let status = document.getElementById('fie-hidden-status');
+      if (!status) {
+        status = document.createElement('span');
+        status.id = 'fie-hidden-status';
+        const savedControl = document.getElementById('fdh-show-saved-wrap');
+        (savedControl || countEl).insertAdjacentElement('afterend', status);
+      }
+      if (status.textContent !== statusMessage) status.textContent = statusMessage;
+      return status;
+    }
+
+    function setStatus(message) {
+      statusMessage = message || '';
+      const status = ensureStatus();
+      if (status && status.textContent !== statusMessage) {
+        status.textContent = statusMessage;
+      }
+    }
+
+    async function hideRemoteListing(propertyId) {
+      const latest = normalizeHiddenListingRows(await fetchHiddenListingRows()).active;
+      const hiddenAt = new Date();
+      latest.set(propertyId, {
+        propertyId,
+        hiddenAt: hiddenAt.toISOString(),
+        hiddenUntil: new Date(hiddenAt.getTime() + HIDDEN_LISTING_TTL_MS).toISOString(),
+      });
+      await writeHiddenListingRows(latest);
+      hiddenListings = latest;
+    }
+
+    function queueListingUpdate(propertyId, button) {
+      button.disabled = true;
+      setStatus('Hiding listing...');
+      syncQueue = syncQueue
+        .then(() => hideRemoteListing(propertyId))
+        .then(() => setStatus(''))
+        .catch((error) => {
+          setStatus(`Could not update hidden listings: ${error.message}`);
+          console.warn('[Fasteignir Data Import/Export] hidden-listing update failed:', error);
+        })
+        .finally(() => {
+          button.disabled = false;
+          applyFiltering();
+        });
+    }
+
+    function ensureCardButton(card, propertyId) {
+      const host = card.querySelector('.estate__item-title');
+      if (!host) return;
+      host.classList.add('fie-hide-button-host');
+
+      let button = host.querySelector('.fie-hide-listing-button');
+      if (!button) {
+        button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'fie-hide-listing-button';
+        host.appendChild(button);
+        button.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+          const id = button.dataset.propertyId;
+          queueListingUpdate(id, button);
+        });
+      }
+
+      button.dataset.propertyId = propertyId;
+      if (button.textContent !== '×') button.textContent = '×';
+      button.title = 'Hide this listing for 30 days';
+      button.setAttribute('aria-label', button.title);
+    }
+
+    function applyFiltering() {
+      for (const card of resultCards()) {
+        card.classList.remove(HIDDEN_CLASS);
+        const propertyId = canonicalPropertyId(card);
+        if (!propertyId || card.classList.contains('wide-item-desktop')) continue;
+        if (!hiddenListingsReady) continue;
+
+        const isHidden = hiddenListings.has(propertyId);
+        if (isHidden) {
+          card.classList.add(HIDDEN_CLASS);
+        } else {
+          ensureCardButton(card, propertyId);
+        }
+      }
+      ensureStatus();
+    }
+
+    function scheduleFiltering() {
+      clearTimeout(applyTimer);
+      applyTimer = setTimeout(applyFiltering, 80);
+    }
+
+    async function loadHiddenListings() {
+      try {
+        const normalized = normalizeHiddenListingRows(await fetchHiddenListingRows());
+        hiddenListings = normalized.active;
+        hiddenListingsReady = true;
+        setStatus('');
+        applyFiltering();
+        if (normalized.expiredCount > 0) {
+          syncQueue = syncQueue
+            .then(() => writeHiddenListingRows(hiddenListings))
+            .catch((error) => console.warn(
+              '[Fasteignir Data Import/Export] could not remove expired hidden listings:',
+              error
+            ));
+        }
+      } catch (error) {
+        hiddenListingsReady = false;
+        setStatus(`Hidden-list sync unavailable: ${error.message}`);
+        console.warn('[Fasteignir Data Import/Export] could not load hidden listings:', error);
+      }
+    }
+
+    applyFiltering();
+    loadHiddenListings();
+    new MutationObserver(scheduleFiltering).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  if (location.pathname.startsWith('/search/results')) {
+    initHiddenSearchListings();
+    return;
   }
 
   function normalizeIspRow(row) {
