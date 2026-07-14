@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.15
+// @version      3.16
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -22,6 +22,8 @@
     let savedPropertyIds = null;
     let showSaved = false;
     let applyTimer = null;
+    let searchStatusMessage = '';
+    let searchStatusHref = null;
 
     const searchStyle = document.createElement('style');
     searchStyle.textContent = `
@@ -101,24 +103,36 @@
         status.id = 'fdh-search-status';
         wrap.insertAdjacentElement('afterend', status);
       }
+      renderSearchStatus(status);
       return { wrap, status };
     }
 
+    function renderSearchStatus(status) {
+      const currentLink = status.firstElementChild && status.firstElementChild.tagName === 'A'
+        ? status.firstElementChild
+        : null;
+      const currentHref = currentLink ? currentLink.getAttribute('href') : null;
+      if (status.textContent === searchStatusMessage && currentHref === searchStatusHref) return;
+
+      status.textContent = '';
+      if (!searchStatusMessage) return;
+
+      if (searchStatusHref) {
+        const link = document.createElement('a');
+        link.href = searchStatusHref;
+        link.textContent = searchStatusMessage;
+        status.appendChild(link);
+      } else {
+        status.textContent = searchStatusMessage;
+      }
+    }
+
     function setSearchStatus(message, href = null) {
+      searchStatusMessage = message || '';
+      searchStatusHref = href;
       const controls = ensureSearchControls();
       if (!controls) return;
-
-      controls.status.textContent = '';
-      if (!message) return;
-
-      if (href) {
-        const link = document.createElement('a');
-        link.href = href;
-        link.textContent = message;
-        controls.status.appendChild(link);
-      } else {
-        controls.status.textContent = message;
-      }
+      renderSearchStatus(controls.status);
     }
 
     function applySearchFiltering() {
@@ -177,7 +191,15 @@
         const response = await fetch('/user/dashboard', {
           credentials: 'include',
           headers: { Accept: 'text/html,application/xhtml+xml' },
+          redirect: 'manual',
         });
+        if (
+          response.type === 'opaqueredirect' ||
+          response.status === 0 ||
+          (response.status >= 300 && response.status < 400)
+        ) {
+          throw new Error('not logged in');
+        }
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const responseUrl = new URL(response.url, location.href);
@@ -209,7 +231,10 @@
         const message = isLoggedOut
           ? 'Sign in to hide saved properties.'
           : 'Saved-property check unavailable.';
-        setSearchStatus(message, isLoggedOut ? '/user/dashboard' : null);
+        setSearchStatus(
+          message,
+          isLoggedOut ? '/user/login?goto=/user/dashboard' : null
+        );
         console.warn('[Fasteignir Helper] could not load saved properties:', error);
       }
       applySearchFiltering();
