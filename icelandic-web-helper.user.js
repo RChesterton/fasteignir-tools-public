@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Icelandic Web Helper
 // @namespace    fasteignir-tools
-// @version      0.12
+// @version      0.11
 // @description  Translation nudges, description expansion, Fasteignaleitin/Fasteignir cross-links, and Fasteignir search-save repair
 // @match        https://fasteignir.visir.is/*
 // @match        https://fasteignir.is/*
@@ -192,13 +192,9 @@
   }
 
   // ============================================================
-  // Fasteignir search page: repair "Vista leit" and hide saved results
+  // Fasteignir search page: repair "Vista leit"
   // ============================================================
   if (isFasteignirVisir && location.pathname.startsWith('/search/results')) {
-    let savedSearchResultsPromise = null;
-    let hideSavedTimer = null;
-    let hideSavedRunId = 0;
-
     function searchSaveStatus(btn, text, isError) {
       if (!btn) return;
       let status = btn.nextElementSibling;
@@ -287,86 +283,6 @@
       });
     }
 
-    function savedSearchHideStatus(text, isError) {
-      let status = document.getElementById('iwh-saved-result-hide-status');
-      if (!status) {
-        const btn = document.querySelector('[id="add-search-favourites"]');
-        if (!btn || !btn.parentElement) return;
-        status = document.createElement('span');
-        status.id = 'iwh-saved-result-hide-status';
-        status.style.cssText = 'margin-left:8px;font-size:13px;color:#555;';
-        btn.parentElement.appendChild(status);
-      }
-      status.style.color = isError ? '#b00020' : '#555';
-      status.textContent = text;
-    }
-
-    async function fetchSavedSearchResults() {
-      if (savedSearchResultsPromise) return savedSearchResultsPromise;
-      savedSearchResultsPromise = fetch('/user/dashboard', { credentials: 'include' })
-        .then(async (res) => {
-          if (!res.ok) throw new Error(`dashboard HTTP ${res.status}`);
-          const html = await res.text();
-          const doc = new DOMParser().parseFromString(html, 'text/html');
-          const savedCards = Array.from(doc.querySelectorAll('.estate__item[data-id]')).map(parseFasteignirCard);
-          return {
-            ids: new Set(savedCards.map((card) => String(card.id)).filter(Boolean)),
-            cards: savedCards,
-          };
-        })
-        .catch((e) => {
-          savedSearchResultsPromise = null;
-          throw e;
-        });
-      return savedSearchResultsPromise;
-    }
-
-    function searchResultMatchesSaved(candidate, saved) {
-      if (candidate.id && saved.ids.has(String(candidate.id))) return true;
-      return saved.cards.some((savedCard) => sameAddress(savedCard, candidate) && detailsMatch(savedCard, candidate));
-    }
-
-    async function hideSavedSearchResults(runId) {
-      let saved;
-      try {
-        saved = await fetchSavedSearchResults();
-      } catch (e) {
-        console.warn('[Icelandic Web Helper] could not load saved properties for search-result hiding:', e);
-        savedSearchHideStatus('Could not load saved properties.', true);
-        return;
-      }
-      if (runId !== hideSavedRunId) return;
-
-      let hiddenCount = 0;
-      let checkedCount = 0;
-      document.querySelectorAll('.estate__item[data-id]').forEach((el) => {
-        const candidate = parseFasteignirCard(el);
-        const shouldHide = searchResultMatchesSaved(candidate, saved);
-        checkedCount++;
-        if (shouldHide) {
-          el.dataset.iwhHiddenSavedResult = 'true';
-          el.style.display = 'none';
-          hiddenCount++;
-        } else if (el.dataset.iwhHiddenSavedResult === 'true') {
-          delete el.dataset.iwhHiddenSavedResult;
-          el.style.display = '';
-        }
-      });
-
-      savedSearchHideStatus(
-        hiddenCount > 0 ? `Hidden already saved: ${hiddenCount}/${checkedCount}` : '',
-        false
-      );
-    }
-
-    function scheduleHideSavedSearchResults() {
-      clearTimeout(hideSavedTimer);
-      hideSavedTimer = setTimeout(() => {
-        hideSavedRunId++;
-        hideSavedSearchResults(hideSavedRunId);
-      }, 250);
-    }
-
     document.addEventListener('click', (event) => {
       const btn = event.target && event.target.closest && event.target.closest('[id="add-search-favourites"]');
       if (btn) handleSaveSearchClick(btn, event);
@@ -374,12 +290,6 @@
 
     patchSaveSearchButton();
     new MutationObserver(patchSaveSearchButton).observe(document.body, {
-      childList: true,
-      subtree: true,
-    });
-
-    scheduleHideSavedSearchResults();
-    new MutationObserver(scheduleHideSavedSearchResults).observe(document.body, {
       childList: true,
       subtree: true,
     });
