@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir Data Import/Export
 // @namespace    fasteignir-tools
-// @version      0.28
+// @version      0.29
 // @description  Import/export saved-property and ISP data, and sync temporary search exclusions
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -1172,7 +1172,7 @@
       .${HIDDEN_CLASS} { display: none !important; }
       .fie-hide-button-host { position: relative !important; padding-right: 44px !important; }
       .fie-hide-listing-button {
-        position: absolute; top: 10px; right: 10px; z-index: 5;
+        position: absolute; top: 10px; right: 10px; z-index: 1;
         width: 24px; height: 24px; padding: 0; border: 0; border-radius: 50%;
         display: inline-flex; align-items: center; justify-content: center;
         background: #d8d8d8; color: #c62828; cursor: pointer;
