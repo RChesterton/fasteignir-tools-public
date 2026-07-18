@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.17
+// @version      3.18
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
+// @match        https://fasteignir.visir.is/property/*
 // @updateURL    https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-dashboard-helper.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-dashboard-helper.user.js
 // @grant        none
@@ -13,6 +14,220 @@
 
 (function () {
   'use strict';
+
+  // ---------- Return to a property after a login-triggered save ----------
+
+  const FAVORITE_INTENT_KEY = 'fdh_favoriteIntent';
+  const PENDING_FAVORITE_KEY = 'fdh_pendingFavorite';
+  const FAVORITE_RESULT_KEY = 'fdh_favoriteResult';
+  const FAVORITE_INTENT_MAX_AGE_MS = 2 * 60 * 1000;
+  const PENDING_FAVORITE_MAX_AGE_MS = 10 * 60 * 1000;
+
+  function removeSessionValue(key) {
+    try {
+      sessionStorage.removeItem(key);
+    } catch (_) {}
+  }
+
+  function writeSessionValue(key, value) {
+    try {
+      sessionStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function readFreshSessionValue(key, maxAgeMs) {
+    try {
+      const value = JSON.parse(sessionStorage.getItem(key) || 'null');
+      const createdAt = Number(value && value.createdAt);
+      if (!value || !Number.isFinite(createdAt) || Date.now() - createdAt > maxAgeMs) {
+        sessionStorage.removeItem(key);
+        return null;
+      }
+      return value;
+    } catch (_) {
+      removeSessionValue(key);
+      return null;
+    }
+  }
+
+  function propertyIdFromUrl(value) {
+    try {
+      const url = new URL(value, location.href);
+      if (url.origin !== location.origin) return null;
+      const match = url.pathname.match(/^\/property\/(\d+)\/?$/);
+      return match ? match[1] : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function safeFavoriteReturnUrl(value) {
+    try {
+      const url = new URL(value, location.href);
+      if (url.origin !== location.origin) return null;
+      if (propertyIdFromUrl(url.href)) return url.href;
+      if (url.pathname.startsWith('/search/results')) return url.href;
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function canonicalPropertyIdFromCard(card) {
+    if (!card) return null;
+    const links = [];
+    if (card.matches('a[href]')) links.push(card);
+    links.push(...card.querySelectorAll('a[href]'));
+    for (const link of links) {
+      const id = propertyIdFromUrl(link.getAttribute('href'));
+      if (id) return id;
+    }
+    return null;
+  }
+
+  function favoriteContextFromControl(control) {
+    const card = control && control.closest('.estate__item');
+    const propertyId = card
+      ? canonicalPropertyIdFromCard(card)
+      : propertyIdFromUrl(location.href);
+    const returnUrl = safeFavoriteReturnUrl(location.href);
+    if (!propertyId || !returnUrl) return null;
+    return { propertyId, returnUrl, createdAt: Date.now() };
+  }
+
+  function installLoginSaveCapture() {
+    document.addEventListener('click', (event) => {
+      const target = event.target && event.target.closest ? event.target : null;
+      if (!target) return;
+
+      const favoriteControl = target.closest([
+        '.add-to-favorites',
+        '.js-add-to-favorites',
+        '.js-add-favourite',
+      ].join(','));
+      if (favoriteControl) {
+        const context = favoriteContextFromControl(favoriteControl);
+        if (context) writeSessionValue(FAVORITE_INTENT_KEY, context);
+      }
+
+      const loginLink = target.closest('a[href*="/user/login"]');
+      if (!loginLink) return;
+      const intent = readFreshSessionValue(FAVORITE_INTENT_KEY, FAVORITE_INTENT_MAX_AGE_MS);
+      if (!intent || !/^\d+$/.test(String(intent.propertyId || ''))) return;
+      const returnUrl = safeFavoriteReturnUrl(intent.returnUrl);
+      if (!returnUrl) return;
+
+      writeSessionValue(PENDING_FAVORITE_KEY, {
+        propertyId: String(intent.propertyId),
+        returnUrl,
+        createdAt: Date.now(),
+      });
+      removeSessionValue(FAVORITE_INTENT_KEY);
+    }, true);
+  }
+
+  function collectJsonMarkers(value, markers = new Set()) {
+    if (Array.isArray(value)) {
+      value.forEach((item) => collectJsonMarkers(item, markers));
+    } else if (value && typeof value === 'object') {
+      Object.entries(value).forEach(([key, item]) => {
+        markers.add(String(key).toLowerCase());
+        collectJsonMarkers(item, markers);
+      });
+    } else if (typeof value === 'string') {
+      markers.add(value.toLowerCase());
+    }
+    return markers;
+  }
+
+  function classifyFavoriteResponse(status, responseText) {
+    if (status < 200 || status >= 300) return 'unconfirmed';
+    let parsed;
+    try {
+      parsed = JSON.parse(responseText);
+    } catch (_) {
+      return 'unconfirmed';
+    }
+    const markers = collectJsonMarkers(parsed);
+    if (markers.has('already_has')) return 'already-saved';
+    if (markers.has('success')) return 'saved';
+    return 'unconfirmed';
+  }
+
+  async function savePendingFavorite(pending) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(`/ajax/add_property_favorite/${pending.propertyId}`, {
+        credentials: 'include',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        signal: controller.signal,
+      });
+      const responseText = await response.text();
+      const outcome = classifyFavoriteResponse(response.status, responseText);
+      console.log(
+        `[Fasteignir Helper] pending save response for ${pending.propertyId} (HTTP ${response.status}):`,
+        responseText.slice(0, 300)
+      );
+      return outcome;
+    } catch (error) {
+      console.warn('[Fasteignir Helper] pending save failed:', error);
+      return 'unconfirmed';
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  function favoriteResultMessage(outcome) {
+    if (outcome === 'saved') return 'Property saved.';
+    if (outcome === 'already-saved') return 'Property was already saved.';
+    return 'Save could not be confirmed. Try the Save button manually.';
+  }
+
+  async function finishPendingFavorite(pending) {
+    removeSessionValue(PENDING_FAVORITE_KEY);
+    const outcome = await savePendingFavorite(pending);
+    writeSessionValue(FAVORITE_RESULT_KEY, {
+      outcome,
+      propertyId: pending.propertyId,
+      returnUrl: pending.returnUrl,
+      createdAt: Date.now(),
+    });
+    location.replace(pending.returnUrl);
+  }
+
+  function showPendingFavoriteResult() {
+    const result = readFreshSessionValue(FAVORITE_RESULT_KEY, PENDING_FAVORITE_MAX_AGE_MS);
+    if (!result) return;
+    removeSessionValue(FAVORITE_RESULT_KEY);
+    setTimeout(() => alert(favoriteResultMessage(result.outcome)), 0);
+  }
+
+  const isPropertyPage = /^\/property\/\d+\/?$/.test(location.pathname);
+  const isSearchResultsPage = location.pathname.startsWith('/search/results');
+  if (isPropertyPage || isSearchResultsPage) {
+    installLoginSaveCapture();
+    showPendingFavoriteResult();
+  }
+
+  if (location.pathname.startsWith('/user/dashboard')) {
+    const pendingFavorite = readFreshSessionValue(
+      PENDING_FAVORITE_KEY,
+      PENDING_FAVORITE_MAX_AGE_MS
+    );
+    if (pendingFavorite && /^\d+$/.test(String(pendingFavorite.propertyId || ''))) {
+      const returnUrl = safeFavoriteReturnUrl(pendingFavorite.returnUrl);
+      if (returnUrl) {
+        pendingFavorite.returnUrl = returnUrl;
+        finishPendingFavorite(pendingFavorite);
+        return;
+      }
+      removeSessionValue(PENDING_FAVORITE_KEY);
+    }
+  }
 
   // ---------- Search results: hide adverts and already-saved properties ----------
 
@@ -252,10 +467,12 @@
     });
   }
 
-  if (location.pathname.startsWith('/search/results')) {
+  if (isSearchResultsPage) {
     initSearchResultsCleaner();
     return;
   }
+
+  if (isPropertyPage) return;
 
   // ---------- Suppress the native "deleted" confirmation popup ----------
   // Clicking the "x" triggers the site's own removal handler, which calls a
