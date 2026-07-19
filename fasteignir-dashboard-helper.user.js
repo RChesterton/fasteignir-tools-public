@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.18
+// @version      3.19
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -113,10 +113,43 @@
         if (context) writeSessionValue(FAVORITE_INTENT_KEY, context);
       }
 
-      const loginLink = target.closest('a[href*="/user/login"]');
-      if (!loginLink) return;
+      const loginLink = target.closest(
+        '.b-favorites-message.error .login-poppup-wrapper a.pop_block2'
+      );
+      if (!loginLink || (loginLink.textContent || '').trim().toLowerCase() !== 'skrá þig inn.') {
+        return;
+      }
       const intent = readFreshSessionValue(FAVORITE_INTENT_KEY, FAVORITE_INTENT_MAX_AGE_MS);
       if (!intent || !/^\d+$/.test(String(intent.propertyId || ''))) return;
+      const returnUrl = safeFavoriteReturnUrl(intent.returnUrl);
+      if (!returnUrl) return;
+
+      intent.returnUrl = returnUrl;
+      intent.loginPromptOpenedAt = Date.now();
+      writeSessionValue(FAVORITE_INTENT_KEY, intent);
+    }, true);
+
+    document.addEventListener('submit', (event) => {
+      const form = event.target;
+      if (
+        !form ||
+        !form.matches ||
+        !form.matches('form#login_form.modal__share-message-form') ||
+        !form.closest('.fancybox-wrap.fancybox-opened')
+      ) {
+        return;
+      }
+
+      const intent = readFreshSessionValue(FAVORITE_INTENT_KEY, FAVORITE_INTENT_MAX_AGE_MS);
+      const loginPromptOpenedAt = Number(intent && intent.loginPromptOpenedAt);
+      if (
+        !intent ||
+        !/^\d+$/.test(String(intent.propertyId || '')) ||
+        !Number.isFinite(loginPromptOpenedAt) ||
+        Date.now() - loginPromptOpenedAt > FAVORITE_INTENT_MAX_AGE_MS
+      ) {
+        return;
+      }
       const returnUrl = safeFavoriteReturnUrl(intent.returnUrl);
       if (!returnUrl) return;
 
@@ -499,6 +532,7 @@
   // word, no matter what that word is.
   const ICE_LETTER = 'a-záðéíóúýþæöA-ZÁÐÉÍÓÚÝÞÆÖ';
   const SOLD_WORD_RE = new RegExp(`(?<![${ICE_LETTER}])(seld|selt)(?![${ICE_LETTER}])`, 'i');
+  const STATUS_DIAGNOSTIC_ONLY = true;
 
   function parsePrice(text) {
     const digits = (text || '').replace(/[^\d]/g, '');
@@ -607,7 +641,11 @@
       addressSaysSold,
       openHouses,
       url: `https://fasteignir.visir.is/property/${id}`,
-      status: addressSaysSold ? 'sold-address' : 'unchecked',
+      status: STATUS_DIAGNOSTIC_ONLY
+        ? 'unchecked'
+        : addressSaysSold
+          ? 'sold-address'
+          : 'unchecked',
     };
   }
 
@@ -670,6 +708,16 @@
     #fdh-postal-list { display: flex; flex-wrap: wrap; gap: 6px; }
     #fdh-postal-list label { display: flex; align-items: center; gap: 3px; font-size: 13px; }
     #fdh-status-line { font-size: 14px; color: #333; }
+    #fdh-status-report { display: none; width: 100%; }
+    #fdh-status-report.fdh-visible { display: block; }
+    #fdh-status-report-actions {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+    }
+    #fdh-status-report-output {
+      width: 100%; min-height: 260px; resize: vertical; box-sizing: border-box;
+      padding: 8px; border: 1px solid #ccc; background: #fff; color: #222;
+      font: 12px/1.4 Consolas, "Courier New", monospace;
+    }
     .fdh-badge {
       display: inline-block; font-size: 11px; font-weight: bold; padding: 2px 8px;
       border-radius: 10px; margin: 4px 0; color: #fff;
@@ -758,8 +806,16 @@
       <div class="fdh-row">
         <button id="fdh-apply">Filter</button>
         <button id="fdh-clear" class="fdh-secondary">Clear filter</button>
+        <button id="fdh-test-status">Test Status Check</button>
         <button id="fdh-remove" class="fdh-danger" disabled>Remove Sold</button>
         <div id="fdh-status-line"></div>
+      </div>
+      <div id="fdh-status-report">
+        <div id="fdh-status-report-actions">
+          <button id="fdh-copy-status-report" class="fdh-secondary">Copy Report</button>
+          <button id="fdh-clear-status-report" class="fdh-secondary">Clear Report</button>
+        </div>
+        <textarea id="fdh-status-report-output" readonly autocomplete="off"></textarea>
       </div>
     </div>
   `;
@@ -1469,12 +1525,14 @@
     }
   }
 
-  // Immediately badge anything we can tell from the address alone, no fetch needed
-  cards.forEach((c) => {
-    if (c.addressSaysSold) {
-      applyStatus(c, 'sold-address');
-    }
-  });
+  // The diagnostic release must not change status or removal eligibility.
+  if (!STATUS_DIAGNOSTIC_ONLY) {
+    cards.forEach((c) => {
+      if (c.addressSaysSold) {
+        applyStatus(c, 'sold-address');
+      }
+    });
+  }
 
   // ---------- "seld" text detection in fetched listing page ----------
 
@@ -1489,6 +1547,224 @@
       return SOLD_WORD_RE.test(window_);
     } catch (e) {
       return false;
+    }
+  }
+
+  // ---------- Read-only status-check diagnostic ----------
+
+  const STATUS_TEST_CONCURRENCY = 16;
+  const STATUS_TEST_TIMEOUT_MS = 15000;
+  const STATUS_TEST_RETRY_DELAYS_MS = [0, 500, 1500];
+  const STATUS_TEST_RETRYABLE_HTTP = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+  function wait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function requestStatusDiagnostic(c) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), STATUS_TEST_TIMEOUT_MS);
+    const startedAt = performance.now();
+    try {
+      const response = await fetch(c.url, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { Accept: 'text/html,application/xhtml+xml' },
+        redirect: 'manual',
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      const durationMs = Math.round(performance.now() - startedAt);
+      const finalUrl = response.url || c.url;
+
+      if (
+        response.type === 'opaqueredirect' ||
+        (response.status >= 300 && response.status < 400)
+      ) {
+        return {
+          classification: 'redirect',
+          status: response.status,
+          responseType: response.type,
+          finalUrl,
+          durationMs,
+          retryable: false,
+          error: null,
+        };
+      }
+
+      const html = await response.text();
+      if (response.status === 404 || finalUrl.includes('/404.html')) {
+        return {
+          classification: 'http-404',
+          status: response.status,
+          responseType: response.type,
+          finalUrl,
+          durationMs,
+          retryable: false,
+          error: null,
+        };
+      }
+      if (html.includes('Umbeðin síða fannst ekki')) {
+        return {
+          classification: 'not-found-page',
+          status: response.status,
+          responseType: response.type,
+          finalUrl,
+          durationMs,
+          retryable: false,
+          error: null,
+        };
+      }
+      if (!response.ok) {
+        return {
+          classification: 'http-error',
+          status: response.status,
+          responseType: response.type,
+          finalUrl,
+          durationMs,
+          retryable: STATUS_TEST_RETRYABLE_HTTP.has(response.status),
+          error: `HTTP ${response.status}`,
+        };
+      }
+      if (checkSoldInText(html)) {
+        return {
+          classification: 'sold-text',
+          status: response.status,
+          responseType: response.type,
+          finalUrl,
+          durationMs,
+          retryable: false,
+          error: null,
+        };
+      }
+      return {
+        classification: 'active',
+        status: response.status,
+        responseType: response.type,
+        finalUrl,
+        durationMs,
+        retryable: false,
+        error: null,
+      };
+    } catch (error) {
+      return {
+        classification: 'transport-error',
+        status: null,
+        responseType: null,
+        finalUrl: c.url,
+        durationMs: Math.round(performance.now() - startedAt),
+        retryable: true,
+        error: error && error.name === 'AbortError'
+          ? `Timed out after ${STATUS_TEST_TIMEOUT_MS} ms`
+          : String(error && error.message ? error.message : error),
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async function testOneStatus(c) {
+    const startedAt = performance.now();
+    let result = null;
+    let attempts = 0;
+
+    for (const retryDelayMs of STATUS_TEST_RETRY_DELAYS_MS) {
+      if (retryDelayMs > 0) await wait(retryDelayMs);
+      attempts++;
+      result = await requestStatusDiagnostic(c);
+      if (!result.retryable) break;
+    }
+
+    return {
+      address: c.street,
+      postcode: c.postal,
+      propertyId: String(c.id),
+      url: c.url,
+      addressSaysSold: c.addressSaysSold,
+      classification: result.classification,
+      httpStatus: result.status,
+      responseType: result.responseType,
+      finalUrl: result.finalUrl,
+      attempts,
+      durationMs: Math.round(performance.now() - startedAt),
+      error: result.error,
+    };
+  }
+
+  function buildStatusDiagnosticReport(results, durationMs) {
+    const classifications = {};
+    for (const result of results) {
+      classifications[result.classification] =
+        (classifications[result.classification] || 0) + 1;
+    }
+    const retriedProperties = results.filter((result) => result.attempts > 1).length;
+    const unresolved = results.filter((result) =>
+      result.classification === 'transport-error' || result.classification === 'http-error'
+    ).length;
+
+    return {
+      reportVersion: 1,
+      scriptVersion: '3.19',
+      generatedAt: new Date().toISOString(),
+      mode: 'report-only',
+      propertiesChanged: 0,
+      settings: {
+        concurrency: STATUS_TEST_CONCURRENCY,
+        timeoutMs: STATUS_TEST_TIMEOUT_MS,
+        maximumAttempts: STATUS_TEST_RETRY_DELAYS_MS.length,
+        redirectHandling: 'manual',
+      },
+      summary: {
+        total: results.length,
+        durationMs,
+        classifications,
+        retriedProperties,
+        unresolved,
+      },
+      attention: results.filter((result) => result.classification !== 'active'),
+      results,
+    };
+  }
+
+  async function runStatusDiagnostic() {
+    const button = document.getElementById('fdh-test-status');
+    const reportWrap = document.getElementById('fdh-status-report');
+    const output = document.getElementById('fdh-status-report-output');
+    button.disabled = true;
+    reportWrap.classList.remove('fdh-visible');
+    output.value = '';
+
+    const results = new Array(cards.length);
+    const startedAt = performance.now();
+    let nextIndex = 0;
+    let completed = 0;
+
+    async function worker() {
+      while (nextIndex < cards.length) {
+        const index = nextIndex++;
+        results[index] = await testOneStatus(cards[index]);
+        completed++;
+        statusLine(`Testing status: ${completed}/${cards.length}`);
+      }
+    }
+
+    try {
+      const workerCount = Math.min(STATUS_TEST_CONCURRENCY, cards.length) || 1;
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
+      const durationMs = Math.round(performance.now() - startedAt);
+      const report = buildStatusDiagnosticReport(results, durationMs);
+      output.value = JSON.stringify(report, null, 2);
+      reportWrap.classList.add('fdh-visible');
+
+      const counts = report.summary.classifications;
+      statusLine(
+        `Test complete: ${report.summary.total} checked, ` +
+        `${counts.active || 0} active, ${counts.redirect || 0} redirects, ` +
+        `${counts['sold-text'] || 0} sold-text, ${report.summary.unresolved} unresolved. ` +
+        'No properties changed.'
+      );
+    } finally {
+      button.disabled = false;
     }
   }
 
@@ -1531,7 +1807,7 @@
 
   async function checkAll() {
     const toCheck = cards.filter((c) => c.status !== 'sold-address');
-    const batchSize = 20;
+    const batchSize = 16;
     setFilterControlsDisabled(true);
     try {
       statusLine('Checking...');
@@ -1651,8 +1927,11 @@
     await checkAll();
   }
 
-  // Automatically check status once when the dashboard loads.
-  runInitialCheck();
+  // Automatic classification is paused in 3.19 while the replacement
+  // request path is validated through the read-only diagnostic report.
+  if (!STATUS_DIAGNOSTIC_ONLY) {
+    runInitialCheck();
+  }
 
   // ---------- Remove Sold ----------
 
@@ -1795,6 +2074,33 @@
     });
   });
 
-  applyFilter();
+  document.getElementById('fdh-test-status').addEventListener('click', () => {
+    runStatusDiagnostic().catch((error) => {
+      console.error('[Fasteignir Helper] status diagnostic failed:', error);
+      statusLine('Status test could not complete. No properties changed.');
+    });
+  });
+
+  document.getElementById('fdh-copy-status-report').addEventListener('click', async () => {
+    const output = document.getElementById('fdh-status-report-output');
+    if (!output.value) return;
+    try {
+      await navigator.clipboard.writeText(output.value);
+      statusLine('Status test report copied. No properties changed.');
+    } catch (_) {
+      output.focus();
+      output.select();
+      document.execCommand('copy');
+      statusLine('Status test report copied. No properties changed.');
+    }
+  });
+
+  document.getElementById('fdh-clear-status-report').addEventListener('click', () => {
+    document.getElementById('fdh-status-report-output').value = '';
+    document.getElementById('fdh-status-report').classList.remove('fdh-visible');
+    statusLine('Status checks are paused. Run Test Status Check.');
+  });
+
+  applyFilter('Status checks are paused. Run Test Status Check.');
   renderDebug();
 })();
