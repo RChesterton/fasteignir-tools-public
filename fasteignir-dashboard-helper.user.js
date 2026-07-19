@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.19
+// @version      3.20
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
 // @match        https://fasteignir.visir.is/property/*
 // @updateURL    https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-dashboard-helper.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/fasteignir-tools-public/main/fasteignir-dashboard-helper.user.js
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      fasteignir.visir.is
 // @run-at       document-end
 // ==/UserScript==
 
@@ -1553,6 +1554,7 @@
   // ---------- Read-only status-check diagnostic ----------
 
   const STATUS_TEST_CONCURRENCY = 16;
+  const RELIST_TEST_CONCURRENCY = 4;
   const STATUS_TEST_TIMEOUT_MS = 15000;
   const STATUS_TEST_RETRY_DELAYS_MS = [0, 500, 1500];
   const STATUS_TEST_RETRYABLE_HTTP = new Set([408, 425, 429, 500, 502, 503, 504]);
@@ -1663,6 +1665,165 @@
     }
   }
 
+  function isConfirmedNotFoundUrl(value) {
+    try {
+      const url = new URL(value);
+      return url.hostname === 'fasteignir.visir.is' && url.pathname === '/404.html';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function requestRedirectDiagnostic(c) {
+    return new Promise((resolve) => {
+      const startedAt = performance.now();
+      let settled = false;
+
+      function finish(result) {
+        if (settled) return;
+        settled = true;
+        resolve({
+          ...result,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+      }
+
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: c.url,
+          headers: { Accept: 'text/html,application/xhtml+xml' },
+          redirect: 'follow',
+          nocache: true,
+          timeout: STATUS_TEST_TIMEOUT_MS,
+          onload: (response) => {
+            const finalUrl = response.finalUrl || c.url;
+            const html = response.responseText || '';
+            const confirmedMissing =
+              response.status === 404 ||
+              isConfirmedNotFoundUrl(finalUrl) ||
+              html.includes('Umbeðin síða fannst ekki');
+
+            if (confirmedMissing) {
+              finish({
+                classification: 'confirmed-missing',
+                status: response.status,
+                statusText: response.statusText || '',
+                finalUrl,
+                retryable: false,
+                error: null,
+              });
+              return;
+            }
+
+            const retryable =
+              response.status === 0 || STATUS_TEST_RETRYABLE_HTTP.has(response.status);
+            finish({
+              classification:
+                response.status >= 200 && response.status < 300
+                  ? 'resolved-nonmissing'
+                  : 'redirect-http-error',
+              status: response.status,
+              statusText: response.statusText || '',
+              finalUrl,
+              retryable,
+              error: response.status >= 200 && response.status < 300
+                ? null
+                : `HTTP ${response.status}`,
+            });
+          },
+          onerror: (response) => finish({
+            classification: 'redirect-transport-error',
+            status: response && Number.isFinite(response.status) ? response.status : null,
+            statusText: response && response.statusText ? response.statusText : '',
+            finalUrl: response && response.finalUrl ? response.finalUrl : c.url,
+            retryable: true,
+            error: 'Tampermonkey request failed',
+          }),
+          ontimeout: () => finish({
+            classification: 'redirect-transport-error',
+            status: null,
+            statusText: '',
+            finalUrl: c.url,
+            retryable: true,
+            error: `Timed out after ${STATUS_TEST_TIMEOUT_MS} ms`,
+          }),
+          onabort: () => finish({
+            classification: 'redirect-transport-error',
+            status: null,
+            statusText: '',
+            finalUrl: c.url,
+            retryable: true,
+            error: 'Tampermonkey request was aborted',
+          }),
+        });
+      } catch (error) {
+        finish({
+          classification: 'redirect-transport-error',
+          status: null,
+          statusText: '',
+          finalUrl: c.url,
+          retryable: true,
+          error: String(error && error.message ? error.message : error),
+        });
+      }
+    });
+  }
+
+  async function resolveRedirectStatus(c) {
+    let result = null;
+    let attempts = 0;
+    for (const retryDelayMs of STATUS_TEST_RETRY_DELAYS_MS) {
+      if (retryDelayMs > 0) await wait(retryDelayMs);
+      attempts++;
+      result = await requestRedirectDiagnostic(c);
+      if (!result.retryable) break;
+    }
+    return {
+      classification: result.classification,
+      httpStatus: result.status,
+      statusText: result.statusText,
+      finalUrl: result.finalUrl,
+      attempts,
+      durationMs: result.durationMs,
+      error: result.error,
+    };
+  }
+
+  function statusFingerprint(c) {
+    return {
+      address: c.street,
+      postcode: c.postal,
+      propertyId: String(c.id),
+      size: c.size,
+      rooms: c.rooms,
+      baths: c.baths,
+      beds: c.beds,
+      price: c.price,
+      isTilbod: c.isTilbod,
+      url: c.url,
+      addressSaysSold: c.addressSaysSold,
+    };
+  }
+
+  function finalStatusClassification(c, initial, redirectResolution) {
+    if (c.addressSaysSold) return 'confirmed-sold-address';
+    if (initial.classification === 'sold-text') return 'confirmed-sold-text';
+    if (
+      initial.classification === 'http-404' ||
+      initial.classification === 'not-found-page'
+    ) {
+      return 'confirmed-missing';
+    }
+    if (initial.classification === 'redirect') {
+      return redirectResolution && redirectResolution.classification === 'confirmed-missing'
+        ? 'confirmed-missing'
+        : 'unknown';
+    }
+    if (initial.classification === 'active') return 'active';
+    return 'unknown';
+  }
+
   async function testOneStatus(c) {
     const startedAt = performance.now();
     let result = null;
@@ -1675,53 +1836,291 @@
       if (!result.retryable) break;
     }
 
+    const redirectResolution = result.classification === 'redirect'
+      ? await resolveRedirectStatus(c)
+      : null;
+    const finalClassification = finalStatusClassification(c, result, redirectResolution);
+
     return {
-      address: c.street,
-      postcode: c.postal,
-      propertyId: String(c.id),
-      url: c.url,
-      addressSaysSold: c.addressSaysSold,
-      classification: result.classification,
+      ...statusFingerprint(c),
+      initialClassification: result.classification,
       httpStatus: result.status,
       responseType: result.responseType,
       finalUrl: result.finalUrl,
       attempts,
+      redirectResolution,
+      finalClassification,
+      wouldBeRemovalCandidate:
+        finalClassification === 'confirmed-missing' ||
+        finalClassification === 'confirmed-sold-text' ||
+        finalClassification === 'confirmed-sold-address',
       durationMs: Math.round(performance.now() - startedAt),
       error: result.error,
+      relistingDryRun: null,
     };
   }
 
-  function buildStatusDiagnosticReport(results, durationMs) {
-    const classifications = {};
-    for (const result of results) {
-      classifications[result.classification] =
-        (classifications[result.classification] || 0) + 1;
+  function cardMatchEvidence(c) {
+    return {
+      propertyId: String(c.id),
+      address: c.street,
+      postcode: c.postal,
+      size: c.size,
+      rooms: c.rooms,
+      baths: c.baths,
+      beds: c.beds,
+      price: c.price,
+      isTilbod: c.isTilbod,
+      url: c.url,
+    };
+  }
+
+  function buildRelistingSearchUrl(c) {
+    const params = new URLSearchParams({ stype: 'sale' });
+    if (c.street) params.set('keyword', searchKeyword(c.street));
+    if (c.size != null) {
+      const areaMin = Math.max(0, Math.floor(c.size) - AREA_SEARCH_TOLERANCE);
+      const areaMax = Math.ceil(c.size) + AREA_SEARCH_TOLERANCE;
+      params.set('area', `${areaMin},${areaMax}`);
     }
-    const retriedProperties = results.filter((result) => result.attempts > 1).length;
-    const unresolved = results.filter((result) =>
-      result.classification === 'transport-error' || result.classification === 'http-error'
+    return `/ajaxsearch/getresults?${params.toString()}`;
+  }
+
+  async function requestRelistingDryRun(c) {
+    const searchUrl = buildRelistingSearchUrl(c);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), STATUS_TEST_TIMEOUT_MS);
+    const startedAt = performance.now();
+
+    try {
+      const response = await fetch(searchUrl, {
+        method: 'GET',
+        headers: {
+          Accept: 'text/html, */*; q=0.01',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        credentials: 'include',
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      const html = await response.text();
+      const durationMs = Math.round(performance.now() - startedAt);
+      if (!response.ok) {
+        return {
+          outcome: 'search-error',
+          searchUrl,
+          manualReviewUrl: buildManualReviewUrl(c),
+          httpStatus: response.status,
+          durationMs,
+          error: `HTTP ${response.status}`,
+          candidates: [],
+        };
+      }
+      if (/Leitin skilaði engum niðurstöðum/i.test(html)) {
+        return {
+          outcome: 'no-match',
+          searchUrl,
+          manualReviewUrl: buildManualReviewUrl(c),
+          httpStatus: response.status,
+          durationMs,
+          error: null,
+          candidates: [],
+        };
+      }
+
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const candidates = Array.from(doc.querySelectorAll('.estate__item[data-id]')).map(parseCard);
+      const candidateEvidence = candidates.map(cardMatchEvidence);
+      if (candidates.length === 0) {
+        return {
+          outcome: 'manual-review',
+          searchUrl,
+          manualReviewUrl: buildManualReviewUrl(c),
+          httpStatus: response.status,
+          durationMs,
+          error: 'Search returned HTML but no property cards were recognized',
+          candidates: [],
+        };
+      }
+
+      const allExactMatches = candidates.filter((candidate) => isRealMatchData(c, candidate));
+      const sameListingMatches = allExactMatches.filter(
+        (candidate) => String(candidate.id) === String(c.id)
+      );
+      const exactMatches = allExactMatches.filter(
+        (candidate) => String(candidate.id) !== String(c.id)
+      );
+      const areaMismatches = candidates.filter((candidate) => isAreaMismatchData(c, candidate));
+      if (exactMatches.length === 1) {
+        return {
+          outcome: 'likely-relisting',
+          searchUrl,
+          manualReviewUrl: buildManualReviewUrl(c),
+          httpStatus: response.status,
+          durationMs,
+          error: null,
+          matches: exactMatches.map(cardMatchEvidence),
+          sameListingMatches: sameListingMatches.map(cardMatchEvidence),
+          candidates: candidateEvidence,
+        };
+      }
+      if (exactMatches.length > 1) {
+        return {
+          outcome: 'ambiguous-likely-relisting',
+          searchUrl,
+          manualReviewUrl: buildManualReviewUrl(c),
+          httpStatus: response.status,
+          durationMs,
+          error: null,
+          matches: exactMatches.map(cardMatchEvidence),
+          sameListingMatches: sameListingMatches.map(cardMatchEvidence),
+          candidates: candidateEvidence,
+        };
+      }
+      if (areaMismatches.length > 0) {
+        return {
+          outcome: 'partial-match-area-change',
+          searchUrl,
+          manualReviewUrl: buildManualReviewUrl(c),
+          httpStatus: response.status,
+          durationMs,
+          error: null,
+          matches: areaMismatches.map(cardMatchEvidence),
+          sameListingMatches: sameListingMatches.map(cardMatchEvidence),
+          candidates: candidateEvidence,
+        };
+      }
+      if (sameListingMatches.length > 0) {
+        return {
+          outcome: 'same-listing-still-searchable',
+          searchUrl,
+          manualReviewUrl: buildManualReviewUrl(c),
+          httpStatus: response.status,
+          durationMs,
+          error: null,
+          matches: sameListingMatches.map(cardMatchEvidence),
+          sameListingMatches: sameListingMatches.map(cardMatchEvidence),
+          candidates: candidateEvidence,
+        };
+      }
+      return {
+        outcome: 'manual-review',
+        searchUrl,
+        manualReviewUrl: buildManualReviewUrl(c),
+        httpStatus: response.status,
+        durationMs,
+        error: null,
+        candidates: candidateEvidence,
+      };
+    } catch (error) {
+      return {
+        outcome: 'search-error',
+        searchUrl,
+        manualReviewUrl: buildManualReviewUrl(c),
+        httpStatus: null,
+        durationMs: Math.round(performance.now() - startedAt),
+        error: error && error.name === 'AbortError'
+          ? `Timed out after ${STATUS_TEST_TIMEOUT_MS} ms`
+          : String(error && error.message ? error.message : error),
+        candidates: [],
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async function analyzeRelistingDryRun(c, statusById) {
+    const activeSavedAtAddress = cards.filter((other) =>
+      other.id !== c.id &&
+      statusById.get(String(other.id)) === 'active' &&
+      other.street &&
+      c.street &&
+      other.street.trim().toLowerCase() === c.street.trim().toLowerCase()
+    );
+    const activeSavedMatches = activeSavedAtAddress.filter((other) => isSameProperty(other, c));
+
+    if (activeSavedMatches.length === 1) {
+      return {
+        outcome: 'active-saved-match',
+        matches: activeSavedMatches.map(cardMatchEvidence),
+        sameAddressActiveCandidates: activeSavedAtAddress.map(cardMatchEvidence),
+        manualReviewUrl: buildManualReviewUrl(c),
+      };
+    }
+    if (activeSavedMatches.length > 1) {
+      return {
+        outcome: 'ambiguous-active-saved-match',
+        matches: activeSavedMatches.map(cardMatchEvidence),
+        sameAddressActiveCandidates: activeSavedAtAddress.map(cardMatchEvidence),
+        manualReviewUrl: buildManualReviewUrl(c),
+      };
+    }
+
+    const searchResult = await requestRelistingDryRun(c);
+    return {
+      ...searchResult,
+      sameAddressActiveCandidates: activeSavedAtAddress.map(cardMatchEvidence),
+    };
+  }
+
+  function countBy(rows, keyFn) {
+    const counts = {};
+    for (const row of rows) {
+      const key = keyFn(row);
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    return counts;
+  }
+
+  function buildStatusDiagnosticReport(results, durationMs, statusDurationMs, relistingDurationMs) {
+    const initialClassifications = countBy(results, (result) => result.initialClassification);
+    const finalClassifications = countBy(results, (result) => result.finalClassification);
+    const relistingRows = results.filter((result) => result.relistingDryRun);
+    const relistingOutcomes = countBy(relistingRows, (result) => result.relistingDryRun.outcome);
+    const retriedProperties = results.filter((result) =>
+      result.attempts > 1 ||
+      (result.redirectResolution && result.redirectResolution.attempts > 1)
     ).length;
+    const unresolved = results.filter((result) =>
+      result.finalClassification === 'unknown'
+    ).length;
+    const confirmedRemovalCandidates = results.filter((result) => result.wouldBeRemovalCandidate);
 
     return {
-      reportVersion: 1,
-      scriptVersion: '3.19',
+      reportVersion: 2,
+      scriptVersion: '3.20',
       generatedAt: new Date().toISOString(),
       mode: 'report-only',
       propertiesChanged: 0,
+      externalWrites: {
+        favoritesSaved: 0,
+        propertiesRemoved: 0,
+        cacheWrites: 0,
+        gistWrites: 0,
+      },
       settings: {
-        concurrency: STATUS_TEST_CONCURRENCY,
+        statusConcurrency: STATUS_TEST_CONCURRENCY,
+        relistingConcurrency: RELIST_TEST_CONCURRENCY,
         timeoutMs: STATUS_TEST_TIMEOUT_MS,
         maximumAttempts: STATUS_TEST_RETRY_DELAYS_MS.length,
-        redirectHandling: 'manual',
+        initialRedirectHandling: 'manual',
+        opaqueRedirectResolution: 'GM_xmlhttpRequest follow',
       },
       summary: {
         total: results.length,
         durationMs,
-        classifications,
+        statusDurationMs,
+        relistingDurationMs,
+        initialClassifications,
+        finalClassifications,
+        confirmedRemovalCandidates: confirmedRemovalCandidates.length,
+        relistingOutcomes,
         retriedProperties,
         unresolved,
       },
-      attention: results.filter((result) => result.classification !== 'active'),
+      confirmedRemovalCandidates,
+      unknown: results.filter((result) => result.finalClassification === 'unknown'),
+      attention: results.filter((result) => result.finalClassification !== 'active'),
       results,
     };
   }
@@ -1751,16 +2150,55 @@
     try {
       const workerCount = Math.min(STATUS_TEST_CONCURRENCY, cards.length) || 1;
       await Promise.all(Array.from({ length: workerCount }, () => worker()));
+      const statusDurationMs = Math.round(performance.now() - startedAt);
+      const statusById = new Map(
+        results.map((result) => [result.propertyId, result.finalClassification])
+      );
+      const cardsById = new Map(cards.map((card) => [String(card.id), card]));
+      const removalCandidates = results.filter((result) => result.wouldBeRemovalCandidate);
+      const relistingStartedAt = performance.now();
+      let nextRelistingIndex = 0;
+      let relistingCompleted = 0;
+
+      async function relistingWorker() {
+        while (nextRelistingIndex < removalCandidates.length) {
+          const result = removalCandidates[nextRelistingIndex++];
+          const card = cardsById.get(result.propertyId);
+          if (!card) {
+            result.relistingDryRun = {
+              outcome: 'manual-review',
+              error: `No dashboard card found for property ID ${result.propertyId}`,
+              matches: [],
+            };
+          } else {
+            result.relistingDryRun = await analyzeRelistingDryRun(card, statusById);
+          }
+          relistingCompleted++;
+          statusLine(`Testing relistings: ${relistingCompleted}/${removalCandidates.length}`);
+        }
+      }
+
+      const relistingWorkerCount = Math.min(RELIST_TEST_CONCURRENCY, removalCandidates.length);
+      if (relistingWorkerCount > 0) {
+        await Promise.all(Array.from({ length: relistingWorkerCount }, () => relistingWorker()));
+      }
+      const relistingDurationMs = Math.round(performance.now() - relistingStartedAt);
       const durationMs = Math.round(performance.now() - startedAt);
-      const report = buildStatusDiagnosticReport(results, durationMs);
+      const report = buildStatusDiagnosticReport(
+        results,
+        durationMs,
+        statusDurationMs,
+        relistingDurationMs
+      );
       output.value = JSON.stringify(report, null, 2);
       reportWrap.classList.add('fdh-visible');
 
-      const counts = report.summary.classifications;
+      const counts = report.summary.finalClassifications;
       statusLine(
         `Test complete: ${report.summary.total} checked, ` +
-        `${counts.active || 0} active, ${counts.redirect || 0} redirects, ` +
-        `${counts['sold-text'] || 0} sold-text, ${report.summary.unresolved} unresolved. ` +
+        `${counts.active || 0} active, ${counts['confirmed-missing'] || 0} confirmed missing, ` +
+        `${(counts['confirmed-sold-text'] || 0) + (counts['confirmed-sold-address'] || 0)} sold, ` +
+        `${report.summary.unresolved} unknown. ` +
         'No properties changed.'
       );
     } finally {
