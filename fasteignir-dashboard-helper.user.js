@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.20
+// @version      3.21
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -533,7 +533,6 @@
   // word, no matter what that word is.
   const ICE_LETTER = 'a-záðéíóúýþæöA-ZÁÐÉÍÓÚÝÞÆÖ';
   const SOLD_WORD_RE = new RegExp(`(?<![${ICE_LETTER}])(seld|selt)(?![${ICE_LETTER}])`, 'i');
-  const STATUS_DIAGNOSTIC_ONLY = true;
 
   function parsePrice(text) {
     const digits = (text || '').replace(/[^\d]/g, '');
@@ -642,11 +641,7 @@
       addressSaysSold,
       openHouses,
       url: `https://fasteignir.visir.is/property/${id}`,
-      status: STATUS_DIAGNOSTIC_ONLY
-        ? 'unchecked'
-        : addressSaysSold
-          ? 'sold-address'
-          : 'unchecked',
+      status: addressSaysSold ? 'sold-address' : 'unchecked',
     };
   }
 
@@ -1040,8 +1035,11 @@
       (c) =>
         (c.status === 'gone' || c.status === 'sold-text' || c.status === 'sold-address') && !c._removed
     ).length;
+    const unknownStatusCount = cards.filter((c) => c.status === 'unknown' && !c._removed).length;
     statusLine(
-      `Showing ${visibleCount} of ${cards.length} properties. Active: ${activeCount}, Removed: ${soldCount}.${suffix ? ' ' + suffix : ''}`
+      `Showing ${visibleCount} of ${cards.length} properties. Active: ${activeCount}, Removed: ${soldCount}` +
+      `${unknownStatusCount > 0 ? `, Unknown status: ${unknownStatusCount}` : ''}.` +
+      `${suffix ? ' ' + suffix : ''}`
     );
   }
 
@@ -1244,6 +1242,16 @@
     }
   }
 
+  function isDifferentListingId(ref, candidate) {
+    return String(candidate.id) !== String(ref.id);
+  }
+
+  function exactReplacementMatches(ref, candidates) {
+    return candidates.filter((candidate) =>
+      isDifferentListingId(ref, candidate) && isRealMatchData(ref, candidate)
+    );
+  }
+
   // Searches silently for a relisting of the sold card c. Returns:
   //   'no-match'         — search returned no results → safe to remove
   //   'favorited'        — found exact match(es), saved them → safe to remove
@@ -1269,6 +1277,10 @@
         credentials: 'include',
       });
       html = await resp.text();
+      if (!resp.ok) {
+        console.error(`[Fasteignir Helper] search returned HTTP ${resp.status} for ${c.id}`);
+        return { outcome: 'error' };
+      }
     } catch (e) {
       console.error('[Fasteignir Helper] search fetch error:', e);
       return { outcome: 'error' };
@@ -1283,16 +1295,16 @@
     const cardEls = Array.from(doc.querySelectorAll('.estate__item[data-id]'));
 
     if (cardEls.length === 0) {
-      // Got a non-empty response that doesn't look like cards — could be a
-      // changed site structure. Treat as ambiguous and flag for manual review.
+      // A non-empty response without recognizable cards means the search
+      // itself could not be trusted. Leave the saved property untouched.
       console.warn(`[Fasteignir Helper] got HTML for ${c.id} but found no card elements`);
-      return { outcome: 'results-no-match' };
+      return { outcome: 'error' };
     }
 
     const candidates = cardEls.map(parseCard);
     console.log(`[Fasteignir Helper] ${candidates.length} card(s) returned:`, candidates.map(cd => `${cd.id} ${cd.street} ${cd.size}m² ${cd.rooms}r`));
 
-    const exactMatches = candidates.filter((cd) => isRealMatchData(c, cd));
+    const exactMatches = exactReplacementMatches(c, candidates);
 
     if (exactMatches.length > 0) {
       console.log(`[Fasteignir Helper] exact match(es):`, exactMatches.map(cd => cd.id));
@@ -1315,7 +1327,9 @@
       return { outcome: 'save-failed' };
     }
 
-    const areaMismatches = candidates.filter((cd) => isAreaMismatchData(c, cd));
+    const areaMismatches = candidates.filter((cd) =>
+      isDifferentListingId(c, cd) && isAreaMismatchData(c, cd)
+    );
     if (areaMismatches.length > 0) {
       console.log(`[Fasteignir Helper] area mismatch for ${c.id}:`, areaMismatches.map(cd => `${cd.id} size=${cd.size}`));
       return { outcome: 'area-mismatch' };
@@ -1378,10 +1392,23 @@
     return silentRelistSearch(c);
   }
 
-  // Resolves c's relisting outcome and, once it's definite, removes c and
-  // any other stale sold duplicates of the same property too. An
-  // "area-mismatch" or "results-no-match" outcome is deliberately NOT treated
-  // as definite — that needs a person to look at it, so nothing gets removed.
+  function shouldRemoveAfterRelisting(status, outcome) {
+    if (
+      outcome === 'favorited' ||
+      outcome === 'already-saved-locally' ||
+      outcome === 'no-match'
+    ) {
+      return true;
+    }
+    const confirmedSold = status === 'sold-text' || status === 'sold-address';
+    return confirmedSold && (outcome === 'area-mismatch' || outcome === 'results-no-match');
+  }
+
+  // Resolves c's relisting outcome and, once it is safe, removes c and any
+  // other stale sold duplicates of the same property. Confirmed-missing
+  // listings retain the existing manual-review protection. A listing whose
+  // own text/card says sold can be removed after a successful search even
+  // when that search finds no exact different-ID replacement.
   async function processSoldProperty(c, resolveFn) {
     let result;
     try {
@@ -1390,11 +1417,7 @@
       console.error('[Fasteignir Helper] error resolving relisting for', c.id, err);
       return { outcome: 'error' };
     }
-    if (
-      result.outcome === 'favorited' ||
-      result.outcome === 'already-saved-locally' ||
-      result.outcome === 'no-match'
-    ) {
+    if (shouldRemoveAfterRelisting(c.status, result.outcome)) {
       removeSavedProperty(c);
       findSoldDuplicates(c).forEach(removeSavedProperty);
       // Keep the cache in sync with this removal immediately, so a later
@@ -1523,17 +1546,19 @@
     } else if (status === 'sold-address') {
       setBadge(c, 'Address says sold', 'fdh-badge-sold-address');
       flagForRemoval(c);
+    } else if (status === 'unknown') {
+      const badge = c.el.querySelector('.fdh-badge');
+      if (badge) badge.remove();
+      const removeButton = c.el.querySelector('.fdh-remove-search-btn');
+      if (removeButton) removeButton.remove();
     }
   }
 
-  // The diagnostic release must not change status or removal eligibility.
-  if (!STATUS_DIAGNOSTIC_ONLY) {
-    cards.forEach((c) => {
-      if (c.addressSaysSold) {
-        applyStatus(c, 'sold-address');
-      }
-    });
-  }
+  cards.forEach((c) => {
+    if (c.addressSaysSold) {
+      applyStatus(c, 'sold-address');
+    }
+  });
 
   // ---------- "seld" text detection in fetched listing page ----------
 
@@ -2088,7 +2113,7 @@
 
     return {
       reportVersion: 2,
-      scriptVersion: '3.20',
+      scriptVersion: '3.21',
       generatedAt: new Date().toISOString(),
       mode: 'report-only',
       propertiesChanged: 0,
@@ -2206,40 +2231,25 @@
     }
   }
 
-  async function checkOne(c, isRetry) {
+  async function checkOne(c) {
     if (c.status === 'sold-address') return; // already known, skip fetch
     setBadge(c, 'Checking...', 'fdh-badge-checking');
     try {
-      const res = await fetch(c.url, { credentials: 'include' });
-      const finalUrl = res.url || c.url;
-      const looksGoneByUrl = finalUrl.includes('404.html') || res.status === 404;
-      if (looksGoneByUrl) {
+      const result = await testOneStatus(c);
+      if (result.finalClassification === 'confirmed-missing') {
         applyStatus(c, 'gone');
-        return;
-      }
-      const html = await res.text();
-      if (html.includes('Umbeðin síða fannst ekki')) {
-        applyStatus(c, 'gone');
-        return;
-      }
-      if (checkSoldInText(html)) {
+      } else if (result.finalClassification === 'confirmed-sold-text') {
         applyStatus(c, 'sold-text');
-        return;
+      } else if (result.finalClassification === 'confirmed-sold-address') {
+        applyStatus(c, 'sold-address');
+      } else if (result.finalClassification === 'active') {
+        applyStatus(c, 'active');
+      } else {
+        applyStatus(c, 'unknown');
       }
-      applyStatus(c, 'active');
-    } catch (e) {
-      if (!isRetry) {
-        await new Promise((r) => setTimeout(r, 400));
-        return checkOne(c, true);
-      }
-      // A repeated fetch failure here, in practice, means the redirect to
-      // the 404 page involves a cross-origin hop the browser won't follow
-      // for a plain fetch (property images are served from a different
-      // subdomain, api-beta.fasteignir.is, so a similar hop on the page
-      // redirect is plausible) - so we treat it as gone rather than as a
-      // separate, ambiguous "error" state.
-      console.warn('[Fasteignir Helper] fetch failed twice for', c.url, '- treating as gone (404).', e);
-      applyStatus(c, 'gone');
+    } catch (error) {
+      console.warn('[Fasteignir Helper] status check was inconclusive for', c.url, error);
+      applyStatus(c, 'unknown');
     }
   }
 
@@ -2276,7 +2286,9 @@
   // detection bug, or a property whose real status has simply changed since)
   // would otherwise get copied forward forever across repeated soft-refreshes
   // with nothing ever re-validating it.
-  const CACHE_KEY = 'fdh_statusCache';
+  // Version the cache key so no status produced by the retired unsafe fetch
+  // path can be restored into the validated classifier.
+  const CACHE_KEY = 'fdh_statusCache_v321';
   const SKIP_FLAG_KEY = 'fdh_skipFullCheck';
   const CACHE_MAX_AGE_MS = 20 * 60 * 1000; // 20 minutes
 
@@ -2365,11 +2377,7 @@
     await checkAll();
   }
 
-  // Automatic classification is paused in 3.19 while the replacement
-  // request path is validated through the read-only diagnostic report.
-  if (!STATUS_DIAGNOSTIC_ONLY) {
-    runInitialCheck();
-  }
+  runInitialCheck();
 
   // ---------- Remove Sold ----------
 
@@ -2438,12 +2446,13 @@
       // got saved.
       const resultPromise = processSoldProperty(c, resolveRelistingDeduped).then((result) => {
         completed++;
+        if (result.outcome === 'area-mismatch') {
+          areaMismatchAddresses.push(c.street);
+        } else if (result.outcome === 'results-no-match') {
+          resultsNoMatchAddresses.push(c.street);
+        }
         if (!c._removed) {
-          if (result.outcome === 'area-mismatch') {
-            areaMismatchAddresses.push(c.street);
-          } else if (result.outcome === 'results-no-match') {
-            resultsNoMatchAddresses.push(c.street);
-          } else {
+          if (result.outcome !== 'area-mismatch' && result.outcome !== 'results-no-match') {
             console.warn('[Fasteignir Helper] leaving', c.id, 'in place - outcome:', result.outcome);
           }
         } else if (result.outcome === 'favorited' || result.outcome === 'already-saved-locally') {
@@ -2536,9 +2545,9 @@
   document.getElementById('fdh-clear-status-report').addEventListener('click', () => {
     document.getElementById('fdh-status-report-output').value = '';
     document.getElementById('fdh-status-report').classList.remove('fdh-visible');
-    statusLine('Status checks are paused. Run Test Status Check.');
+    applyFilter();
   });
 
-  applyFilter('Status checks are paused. Run Test Status Check.');
+  applyFilter('Checking listing status...');
   renderDebug();
 })();
