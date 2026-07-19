@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.22
+// @version      3.23
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -1208,38 +1208,135 @@
     return true;
   }
 
+  const LIVE_RELIST_CONCURRENCY = 4;
+  const LIVE_OPERATION_TIMEOUT_MS = 15000;
+  const LIVE_RETRY_DELAYS_MS = [0, 750, 2000];
+  const LIVE_RETRYABLE_HTTP = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+  function parseJsonScalar(text) {
+    try {
+      const value = JSON.parse(text);
+      return typeof value === 'string' ? value : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function requestTextOnce(url, options) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), LIVE_OPERATION_TIMEOUT_MS);
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+      return {
+        ok: response.ok,
+        status: response.status,
+        text: await response.text(),
+        finalUrl: response.url || url,
+        retryable: LIVE_RETRYABLE_HTTP.has(response.status),
+        error: null,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        status: null,
+        text: '',
+        finalUrl: url,
+        retryable: true,
+        error: error && error.name === 'AbortError'
+          ? `Timed out after ${LIVE_OPERATION_TIMEOUT_MS} ms`
+          : String(error && error.message ? error.message : error),
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async function requestTextWithRetries(url, options) {
+    let result = null;
+    let attempts = 0;
+    for (const retryDelayMs of LIVE_RETRY_DELAYS_MS) {
+      if (retryDelayMs > 0) await wait(retryDelayMs);
+      attempts++;
+      result = await requestTextOnce(url, options);
+      if (!result.retryable) break;
+    }
+    return { ...result, attempts };
+  }
+
+  async function runBoundedWorkers(items, concurrency, handler, onProgress) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    let completed = 0;
+    let active = 0;
+
+    async function worker() {
+      while (true) {
+        const index = nextIndex++;
+        if (index >= items.length) return;
+        active++;
+        if (onProgress) onProgress({ phase: 'started', completed, active, total: items.length });
+        try {
+          results[index] = await handler(items[index], index);
+        } finally {
+          active--;
+          completed++;
+          if (onProgress) {
+            onProgress({
+              phase: 'completed',
+              completed,
+              active,
+              total: items.length,
+              result: results[index],
+            });
+          }
+        }
+      }
+    }
+
+    const workerCount = Math.min(Math.max(1, concurrency), items.length);
+    if (workerCount > 0) {
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    }
+    return results;
+  }
+
   // Calls the site's add-to-favorites endpoint directly for a known property
   // ID. Returns 'newly-saved', 'already-saved', or 'failed'.
   async function saveSilently(id) {
+    const response = await requestTextWithRetries(`/ajax/add_property_favorite/${id}`, {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      cache: 'no-store',
+    });
+    const scalar = response.ok ? parseJsonScalar(response.text) : null;
+    const outcome = scalar === 'success'
+      ? 'newly-saved'
+      : scalar === 'already_has'
+        ? 'already-saved'
+        : 'failed';
+    console.log(
+      `[Fasteignir Helper] save response for ${id} ` +
+      `(HTTP ${response.status == null ? 'none' : response.status}, ${response.attempts} attempt(s)):`,
+      response.text.slice(0, 300) || response.error
+    );
     try {
-      const resp = await fetch(`/ajax/add_property_favorite/${id}`, {
-        credentials: 'include',
-        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      const existing = JSON.parse(sessionStorage.getItem('fdh_saveDiag') || '[]');
+      existing.push({
+        id,
+        httpStatus: response.status,
+        body: response.text.slice(0, 500),
+        error: response.error,
+        attempts: response.attempts,
+        outcome,
+        ts: new Date().toISOString(),
       });
-      const text = await resp.text();
-      console.log(`[Fasteignir Helper] save response for ${id} (HTTP ${resp.status}):`, text.slice(0, 300));
-      let outcome;
-      if (!resp.ok) {
-        outcome = 'failed';
-      } else if (text.includes('"success"')) {
-        outcome = 'newly-saved';
-      } else if (text.includes('"already_has"')) {
-        outcome = 'already-saved';
-      } else {
-        // Unknown response body but HTTP 200 — treat as success until we see otherwise.
-        outcome = 'newly-saved';
-      }
-      // Persist diagnostics so they survive the page reload that follows a save.
-      try {
-        const existing = JSON.parse(sessionStorage.getItem('fdh_saveDiag') || '[]');
-        existing.push({ id, httpStatus: resp.status, body: text.slice(0, 500), outcome, ts: new Date().toISOString() });
-        sessionStorage.setItem('fdh_saveDiag', JSON.stringify(existing));
-      } catch (_) {}
-      return outcome;
-    } catch (e) {
-      console.error(`[Fasteignir Helper] save error for ${id}:`, e);
-      return 'failed';
-    }
+      sessionStorage.setItem('fdh_saveDiag', JSON.stringify(existing));
+    } catch (_) {}
+    return outcome;
   }
 
   function isDifferentListingId(ref, candidate) {
@@ -1270,21 +1367,20 @@
     const searchUrl = `/ajaxsearch/getresults?${params.toString()}`;
     console.log(`[Fasteignir Helper] silent search for ${c.id} (${c.street}): ${searchUrl}`);
 
-    let html;
-    try {
-      const resp = await fetch(searchUrl, {
-        headers: { 'Accept': 'text/html, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest' },
-        credentials: 'include',
-      });
-      html = await resp.text();
-      if (!resp.ok) {
-        console.error(`[Fasteignir Helper] search returned HTTP ${resp.status} for ${c.id}`);
-        return { outcome: 'error' };
-      }
-    } catch (e) {
-      console.error('[Fasteignir Helper] search fetch error:', e);
+    const response = await requestTextWithRetries(searchUrl, {
+      method: 'GET',
+      headers: { 'Accept': 'text/html, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest' },
+      credentials: 'include',
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      console.error(
+        `[Fasteignir Helper] search failed for ${c.id} after ${response.attempts} attempt(s):`,
+        response.error || `HTTP ${response.status}`
+      );
       return { outcome: 'error' };
     }
+    const html = response.text;
 
     if (/Leitin skilaði engum niðurstöðum/i.test(html)) {
       console.log(`[Fasteignir Helper] no results for ${c.id}`);
@@ -1372,14 +1468,80 @@
     );
   }
 
-  // Removes a saved property exactly once, even if called more than once for
-  // the same card (e.g. once directly, once as a side effect of cleaning up
-  // a duplicate sibling elsewhere in the same batch).
-  function removeSavedProperty(c) {
-    if (c._removed) return;
-    c._removed = true;
-    const closeBtn = c.el.querySelector('.js-remove-favourite');
-    if (closeBtn) closeBtn.click();
+  const removalPromisesById = new Map();
+
+  async function verifySavedPropertyAbsent(id) {
+    const response = await requestTextWithRetries('/user/dashboard', {
+      method: 'GET',
+      credentials: 'include',
+      headers: { Accept: 'text/html,application/xhtml+xml' },
+      cache: 'no-store',
+    });
+    if (!response.ok) return null;
+    try {
+      const finalUrl = new URL(response.finalUrl, location.href);
+      if (finalUrl.pathname !== '/user/dashboard') return null;
+      const doc = new DOMParser().parseFromString(response.text, 'text/html');
+      const savedCards = Array.from(doc.querySelectorAll('.estate__item[data-id]'));
+      if (savedCards.length === 0) return null;
+      return !savedCards.some((el) => String(el.dataset.id) === String(id));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Removes a saved property exactly once. The card is marked removed only
+  // after the site's endpoint confirms success, or a fresh dashboard fetch
+  // proves the ID is no longer saved after a lost response.
+  async function removeSavedProperty(c) {
+    if (c._removed) return true;
+    const id = String(c.id);
+    if (removalPromisesById.has(id)) return removalPromisesById.get(id);
+
+    const removalPromise = (async () => {
+      let confirmed = false;
+      for (const retryDelayMs of LIVE_RETRY_DELAYS_MS) {
+        if (retryDelayMs > 0) await wait(retryDelayMs);
+        const response = await requestTextOnce(`/ajax/remove_property_favorite/${id}`, {
+          method: 'GET',
+          credentials: 'include',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          cache: 'no-store',
+        });
+        const scalar = response.ok ? parseJsonScalar(response.text) : null;
+        console.log(
+          `[Fasteignir Helper] remove response for ${id} ` +
+          `(HTTP ${response.status == null ? 'none' : response.status}):`,
+          response.text.slice(0, 300) || response.error
+        );
+        if (scalar === 'success') {
+          confirmed = true;
+          break;
+        }
+
+        const absent = await verifySavedPropertyAbsent(id);
+        if (absent === true) {
+          confirmed = true;
+          break;
+        }
+        if (!response.retryable) break;
+      }
+
+      if (!confirmed) {
+        console.warn(`[Fasteignir Helper] removal was not confirmed for ${id}; leaving it in place`);
+        return false;
+      }
+      c._removed = true;
+      c.el.remove();
+      return true;
+    })();
+
+    removalPromisesById.set(id, removalPromise);
+    try {
+      return await removalPromise;
+    } finally {
+      removalPromisesById.delete(id);
+    }
   }
 
   // If a still-active duplicate is already saved, skip the search entirely.
@@ -1410,21 +1572,29 @@
   // own text/card says sold can be removed after a successful search even
   // when that search finds no exact different-ID replacement.
   async function processSoldProperty(c, resolveFn) {
+    if (c._removed) return { outcome: 'already-removed', removedCount: 0, removalFailed: false };
     let result;
     try {
       result = await (resolveFn ? resolveFn(c) : resolveRelisting(c));
     } catch (err) {
       console.error('[Fasteignir Helper] error resolving relisting for', c.id, err);
-      return { outcome: 'error' };
+      return { outcome: 'error', removedCount: 0, removalFailed: false };
     }
+    let removedCount = 0;
+    let removalFailed = false;
     if (shouldRemoveAfterRelisting(c.status, result.outcome)) {
-      removeSavedProperty(c);
-      findSoldDuplicates(c).forEach(removeSavedProperty);
-      // Keep the cache in sync with this removal immediately, so a later
-      // soft-refresh doesn't restore a stale status for something already handled.
-      saveStatusCache();
+      const removalTargets = [c, ...findSoldDuplicates(c)];
+      for (const target of removalTargets) {
+        if (target._removed) continue;
+        if (await removeSavedProperty(target)) {
+          removedCount++;
+        } else {
+          removalFailed = true;
+        }
+      }
+      if (removedCount > 0) saveStatusCache();
     }
-    return result;
+    return { ...result, removedCount, removalFailed };
   }
 
   // ---------- Price-change reporting ----------
@@ -1495,6 +1665,7 @@
         let msg = `${c.street}: ${count > 1 ? count + ' relistings were saved to your properties.' : 'A relisting was saved to your properties.'}`;
         const priceLine = priceChangeLine(c.price, c.isTilbod, result.newPrice, !!result.newIsTilbod);
         if (priceLine) msg += '\n' + priceLine;
+        if (result.removalFailed) msg += '\nThe old saved listing could not be confirmed as removed and was left in place.';
         alert(msg);
         // A reload is needed — the new relisting was favorited via fetch, so
         // this page's DOM has no way to know about it otherwise.
@@ -1503,11 +1674,17 @@
         let msg = `${c.street}: An active listing for this property was already in your saved properties.`;
         const priceLine = priceChangeLine(c.price, c.isTilbod, result.newPrice, !!result.newIsTilbod);
         if (priceLine) msg += '\n' + priceLine;
+        if (result.removalFailed) msg += '\nThe old saved listing could not be confirmed as removed and was left in place.';
         alert(msg);
         applyFilter();
         renderOpenHouses();
       } else if (result.outcome === 'no-match') {
-        alert(`${c.street}: No new listing was found.`);
+        alert(
+          `${c.street}: No new listing was found.` +
+          (result.removalFailed
+            ? '\nThe old saved listing could not be confirmed as removed and was left in place.'
+            : '')
+        );
         applyFilter();
         renderOpenHouses();
       } else if (result.outcome === 'area-mismatch') {
@@ -2113,7 +2290,7 @@
 
     return {
       reportVersion: 2,
-      scriptVersion: '3.22',
+      scriptVersion: '3.23',
       generatedAt: new Date().toISOString(),
       mode: 'report-only',
       propertiesChanged: 0,
@@ -2386,7 +2563,9 @@
 
   async function removeSold() {
     const toRemove = cards.filter(
-      (c) => c.status === 'gone' || c.status === 'sold-text' || c.status === 'sold-address'
+      (c) =>
+        !c._removed &&
+        (c.status === 'gone' || c.status === 'sold-text' || c.status === 'sold-address')
     );
     if (toRemove.length === 0) {
       originalAlert('No sold properties to remove.');
@@ -2400,80 +2579,71 @@
       return;
     }
 
-    // Deduplicate: multiple sold entries for the same physical property share
-    // a single silent search outcome.
-    const relistOutcomeCache = new Map();
+    // Deduplicate exact property fingerprints so stale copies of the same
+    // property share one complete search/save/remove pipeline.
     function propertyKey(c) {
       return `${(c.street || '').trim().toLowerCase()}|${c.size}|${c.rooms}|${c.baths}|${c.beds}`;
     }
-    function resolveRelistingDeduped(c) {
-      const key = propertyKey(c);
-      if (relistOutcomeCache.has(key)) return relistOutcomeCache.get(key);
-      const dup = findActiveDuplicate(c);
-      const p = dup
-        ? Promise.resolve({ outcome: 'already-saved-locally', newPrice: dup.price, newIsTilbod: dup.isTilbod })
-        : silentRelistSearch(c);
-      relistOutcomeCache.set(key, p);
-      return p;
+    const workByProperty = new Map();
+    for (const card of toRemove) {
+      const key = propertyKey(card);
+      if (!workByProperty.has(key)) workByProperty.set(key, card);
     }
+    const workItems = Array.from(workByProperty.values());
 
-    const resultPromises = [];
     const priceChanges = [];
     const areaMismatchAddresses = [];
     const resultsNoMatchAddresses = [];
-
-    // Live counters for rolling status updates
-    let queued = 0;
-    let completed = 0;
     let relistingsSaved = 0;
     let alreadySavedLive = 0;
-    const total = toRemove.filter((c) => !c._removed).length;
+    let unresolvedOperations = 0;
 
-    function updateStatus() {
-      const parts = [`Removing sold: ${queued}/${total}`];
-      if (completed > 0) parts.push(`${completed} done`);
-      if (relistingsSaved > 0) parts.push(`${relistingsSaved} relisting${relistingsSaved === 1 ? '' : 's'} saved`);
-      if (alreadySavedLive > 0) parts.push(`${alreadySavedLive} already active`);
-      statusLine(parts.join(' — ') + '...');
+    function updateStatus(progress) {
+      const removedCount = toRemove.filter((c) => c._removed).length;
+      statusLine(
+        `Removing sold: ${progress.completed}/${progress.total} checks complete. ` +
+        `${progress.active} active. ${relistingsSaved} saved. ` +
+        `${removedCount}/${toRemove.length} removed. ${unresolvedOperations} unresolved.`
+      );
     }
 
-    for (const c of toRemove) {
-      if (c._removed) continue; // already cleaned up as another property's sold duplicate
-      queued++;
-      statusLine(`Removing sold (${queued}/${total}): ${c.street}...`);
-
-      // Removal of c (and any other sold duplicates of the same property) is
-      // handled inside processSoldProperty, and only once the outcome is
-      // definite - removing unconditionally would risk losing track of the
-      // property entirely if the search comes back uncertain and no relisting
-      // got saved.
-      const resultPromise = processSoldProperty(c, resolveRelistingDeduped).then((result) => {
-        completed++;
-        if (result.outcome === 'area-mismatch') {
-          areaMismatchAddresses.push(c.street);
-        } else if (result.outcome === 'results-no-match') {
-          resultsNoMatchAddresses.push(c.street);
+    updateStatus({ completed: 0, active: 0, total: workItems.length });
+    const outcomes = await runBoundedWorkers(
+      workItems,
+      LIVE_RELIST_CONCURRENCY,
+      async (c) => {
+        try {
+          const result = await processSoldProperty(c);
+          return { ...result, card: c };
+        } catch (error) {
+          console.error('[Fasteignir Helper] live removal pipeline failed for', c.id, error);
+          return { outcome: 'error', card: c, removedCount: 0, removalFailed: false };
         }
-        if (!c._removed) {
-          if (result.outcome !== 'area-mismatch' && result.outcome !== 'results-no-match') {
-            console.warn('[Fasteignir Helper] leaving', c.id, 'in place - outcome:', result.outcome);
+      },
+      (progress) => {
+        if (progress.phase === 'completed') {
+          const result = progress.result;
+          const c = result.card;
+          if (result.outcome === 'area-mismatch') {
+            areaMismatchAddresses.push(c.street);
+          } else if (result.outcome === 'results-no-match') {
+            resultsNoMatchAddresses.push(c.street);
           }
-        } else if (result.outcome === 'favorited' || result.outcome === 'already-saved-locally') {
-          const line = priceChangeLine(c.price, c.isTilbod, result.newPrice, !!result.newIsTilbod);
-          if (line) priceChanges.push(`${c.street}: ${line}`);
-          if (result.outcome === 'favorited') relistingsSaved += result.savedCount || 1;
-          if (result.outcome === 'already-saved-locally') alreadySavedLive++;
+          if (!c._removed) {
+            if (result.outcome !== 'area-mismatch' && result.outcome !== 'results-no-match') {
+              console.warn('[Fasteignir Helper] leaving', c.id, 'in place - outcome:', result.outcome);
+            }
+          } else if (result.outcome === 'favorited' || result.outcome === 'already-saved-locally') {
+            const line = priceChangeLine(c.price, c.isTilbod, result.newPrice, !!result.newIsTilbod);
+            if (line) priceChanges.push(`${c.street}: ${line}`);
+            if (result.outcome === 'favorited') relistingsSaved += result.savedCount || 1;
+            if (result.outcome === 'already-saved-locally') alreadySavedLive++;
+          }
+          if (!c._removed && result.outcome !== 'already-removed') unresolvedOperations++;
         }
-        updateStatus();
-        return result;
-      });
-      resultPromises.push(resultPromise);
-      // Small delay between searches so we don't hammer the server.
-      await new Promise((r) => setTimeout(r, 600));
-    }
-
-    statusLine(`Finishing up — ${resultPromises.length} search${resultPromises.length === 1 ? '' : 'es'} in flight...`);
-    const outcomes = await Promise.all(resultPromises);
+        updateStatus(progress);
+      }
+    );
 
     const favoritedCount = outcomes.reduce(
       (sum, o) => sum + (o.outcome === 'favorited' ? o.savedCount || 1 : 0),
@@ -2491,24 +2661,27 @@
       message += ` ${alreadySavedCount} already had an active listing saved.`;
     }
     if (uncertainCount > 0) {
-      message += ` ${uncertainCount} could not be confirmed and ${uncertainCount === 1 ? 'was' : 'were'} left in your saved list — please check manually.`;
+      message += ` ${uncertainCount} could not be confirmed and ${uncertainCount === 1 ? 'was' : 'were'} left in your saved list. Please check manually.`;
     }
     if (priceChanges.length > 0) {
       message += `\nPrice changes:\n${priceChanges.join('\n')}`;
     }
     if (areaMismatchAddresses.length > 0) {
-      message += `\nNOTE — different floor area found (manual review needed): ${areaMismatchAddresses.join(', ')}`;
+      message += `\nNOTE: different floor area found (manual review needed): ${areaMismatchAddresses.join(', ')}`;
     }
     if (resultsNoMatchAddresses.length > 0) {
-      message += `\nNOTE — results found but no detail match (manual review needed): ${resultsNoMatchAddresses.join(', ')}`;
+      message += `\nNOTE: results found but no detail match (manual review needed): ${resultsNoMatchAddresses.join(', ')}`;
     }
 
+    statusLine(
+      `Remove Sold complete. ${removedCount} removed. ${favoritedCount} saved. ` +
+      `${uncertainCount} unresolved.`
+    );
     alert(message);
 
-    if (favoritedCount > 0) {
-      // A reload is only needed when something new was actually favorited -
-      // that happened via fetch, so this page has no way to know about it
-      // otherwise. Uses the cache, so this doesn't re-check everyone else.
+    if (favoritedCount > 0 || removedCount > 0) {
+      // Direct save/removal calls do not update every part of the current DOM.
+      // Reload with the bounded cache path so the dashboard reflects the server.
       reloadUsingCache();
     } else {
       applyFilter();
