@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.23
+// @version      3.24
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -1772,7 +1772,7 @@
     try {
       const response = await fetch(c.url, {
         method: 'GET',
-        credentials: 'include',
+        credentials: 'omit',
         headers: { Accept: 'text/html,application/xhtml+xml' },
         redirect: 'manual',
         cache: 'no-store',
@@ -1894,6 +1894,7 @@
         GM_xmlhttpRequest({
           method: 'GET',
           url: c.url,
+          anonymous: true,
           headers: { Accept: 'text/html,application/xhtml+xml' },
           redirect: 'follow',
           nocache: true,
@@ -2290,7 +2291,7 @@
 
     return {
       reportVersion: 2,
-      scriptVersion: '3.23',
+      scriptVersion: '3.24',
       generatedAt: new Date().toISOString(),
       mode: 'report-only',
       propertiesChanged: 0,
