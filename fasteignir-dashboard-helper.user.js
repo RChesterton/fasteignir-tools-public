@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      3.21
+// @version      3.22
 // @description  Adds filters, sold-listing detection, and relisting search to your saved properties on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -1578,7 +1578,7 @@
 
   // ---------- Read-only status-check diagnostic ----------
 
-  const STATUS_TEST_CONCURRENCY = 16;
+  const STATUS_CHECK_CONCURRENCY = 16;
   const RELIST_TEST_CONCURRENCY = 4;
   const STATUS_TEST_TIMEOUT_MS = 15000;
   const STATUS_TEST_RETRY_DELAYS_MS = [0, 500, 1500];
@@ -2113,7 +2113,7 @@
 
     return {
       reportVersion: 2,
-      scriptVersion: '3.21',
+      scriptVersion: '3.22',
       generatedAt: new Date().toISOString(),
       mode: 'report-only',
       propertiesChanged: 0,
@@ -2124,7 +2124,7 @@
         gistWrites: 0,
       },
       settings: {
-        statusConcurrency: STATUS_TEST_CONCURRENCY,
+        statusConcurrency: STATUS_CHECK_CONCURRENCY,
         relistingConcurrency: RELIST_TEST_CONCURRENCY,
         timeoutMs: STATUS_TEST_TIMEOUT_MS,
         maximumAttempts: STATUS_TEST_RETRY_DELAYS_MS.length,
@@ -2173,7 +2173,7 @@
     }
 
     try {
-      const workerCount = Math.min(STATUS_TEST_CONCURRENCY, cards.length) || 1;
+      const workerCount = Math.min(STATUS_CHECK_CONCURRENCY, cards.length) || 1;
       await Promise.all(Array.from({ length: workerCount }, () => worker()));
       const statusDurationMs = Math.round(performance.now() - startedAt);
       const statusById = new Map(
@@ -2255,7 +2255,7 @@
 
   async function checkAll() {
     const toCheck = cards.filter((c) => c.status !== 'sold-address');
-    const batchSize = 16;
+    const batchSize = STATUS_CHECK_CONCURRENCY;
     setFilterControlsDisabled(true);
     try {
       statusLine('Checking...');
@@ -2362,7 +2362,10 @@
             }
           });
           if (uncached.length > 0) {
-            await Promise.all(uncached.map((c) => checkOne(c)));
+            for (let i = 0; i < uncached.length; i += STATUS_CHECK_CONCURRENCY) {
+              const batch = uncached.slice(i, i + STATUS_CHECK_CONCURRENCY);
+              await Promise.all(batch.map((c) => checkOne(c)));
+            }
           }
           applyFilter('(using cached results)');
           saveStatusCache();
