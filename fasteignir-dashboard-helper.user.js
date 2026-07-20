@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fasteignir.is Dashboard Helper
 // @namespace    fasteignir-dashboard-helper
-// @version      4.0
+// @version      4.1
 // @description  Manage saved properties, search results, listing status, relistings, data exports, and ISP checks on fasteignir.visir.is
 // @match        https://fasteignir.visir.is/user/dashboard*
 // @match        https://fasteignir.visir.is/search/results*
@@ -19,10 +19,13 @@
 // ==/UserScript==
 
 /*
-  v4.0 consolidates Dashboard Helper 3.24 and Data Import/Export 0.29.
+  v4.0 consolidated Dashboard Helper 3.24 and Data Import/Export 0.29.
   Their feature implementations remain in separate function scopes so the
   consolidation changes metadata and startup routing without changing the
   established dashboard, search, Gist, or ISP behavior.
+
+  v4.1 adds a fail-closed two-transport missing-listing gate before a listing
+  can be treated as missing or processed by Remove Sold.
 */
 
 (function () {
@@ -1369,7 +1372,7 @@
   //   'results-no-match' — results found but nothing matched → leave, open tab
   //   'save-failed'      — found a match but save endpoint failed → leave in place
   //   'error'            — network/parse failure → leave in place
-  async function silentRelistSearch(c) {
+  async function silentRelistSearch(c, { protectedOriginalIds = [] } = {}) {
     const params = new URLSearchParams({ stype: 'sale' });
     if (c.street) params.set('keyword', searchKeyword(c.street));
     if (c.size != null) {
@@ -1412,6 +1415,18 @@
 
     const candidates = cardEls.map(parseCard);
     console.log(`[Fasteignir Helper] ${candidates.length} card(s) returned:`, candidates.map(cd => `${cd.id} ${cd.street} ${cd.size}m² ${cd.rooms}r`));
+
+    const protectedIdSet = new Set(protectedOriginalIds.map((id) => String(id)));
+    const originalListingStillSearchable = candidates.some((candidate) =>
+      protectedIdSet.has(String(candidate.id))
+    );
+    if (originalListingStillSearchable) {
+      console.warn(
+        `[Fasteignir Helper] original missing listing for ${c.id} is still searchable; ` +
+        'leaving it in place for manual review'
+      );
+      return { outcome: 'original-listing-still-searchable' };
+    }
 
     const exactMatches = exactReplacementMatches(c, candidates);
 
@@ -1470,13 +1485,16 @@
     return cards.find((other) => other.id !== c.id && other.status === 'active' && isSameProperty(other, c));
   }
 
-  // Other saved entries for this same property that are themselves sold -
-  // stale duplicates to clean up alongside c once we know an active entry exists.
-  function findSoldDuplicates(c) {
+  // Do not mix missing and independently confirmed sold entries. A confirmed
+  // sold status retains its approved route, while every missing ID must pass
+  // its own fresh F-010 gate before it can be removed.
+  function findSameRemovalCategoryDuplicates(c) {
     return cards.filter(
       (other) =>
         other.id !== c.id &&
-        (other.status === 'gone' || other.status === 'sold-text' || other.status === 'sold-address') &&
+        (c.status === 'gone'
+          ? other.status === 'gone'
+          : other.status === 'sold-text' || other.status === 'sold-address') &&
         isSameProperty(other, c)
     );
   }
@@ -1559,12 +1577,12 @@
 
   // If a still-active duplicate is already saved, skip the search entirely.
   // Otherwise do a silent search.
-  function resolveRelisting(c) {
+  function resolveRelisting(c, protectedOriginalIds = []) {
     const dup = findActiveDuplicate(c);
     if (dup) {
       return Promise.resolve({ outcome: 'already-saved-locally', newPrice: dup.price, newIsTilbod: dup.isTilbod });
     }
-    return silentRelistSearch(c);
+    return silentRelistSearch(c, { protectedOriginalIds });
   }
 
   function shouldRemoveAfterRelisting(status, outcome) {
@@ -1579,16 +1597,80 @@
     return confirmedSold && (outcome === 'area-mismatch' || outcome === 'results-no-match');
   }
 
+  function applyFinalStatusClassification(c, finalClassification) {
+    if (finalClassification === 'confirmed-missing') {
+      applyStatus(c, 'gone');
+    } else if (finalClassification === 'confirmed-sold-text') {
+      applyStatus(c, 'sold-text');
+    } else if (finalClassification === 'confirmed-sold-address') {
+      applyStatus(c, 'sold-address');
+    } else if (finalClassification === 'active') {
+      applyStatus(c, 'active');
+    } else {
+      applyStatus(c, 'unknown');
+    }
+  }
+
+  // A card that was previously displayed as missing must be checked again
+  // before the live relisting/save/remove pipeline can touch it. This is also
+  // used by the per-card Remove & Search path.
+  async function preflightMissingRemoval(c) {
+    if (c.status !== 'gone') {
+      return { eligible: true, finalClassification: c.status };
+    }
+    setBadge(c, 'Confirming missing...', 'fdh-badge-checking');
+    const result = await testOneStatus(c);
+    applyFinalStatusClassification(c, result.finalClassification);
+    return {
+      eligible: result.finalClassification === 'confirmed-missing',
+      finalClassification: result.finalClassification,
+      result,
+    };
+  }
+
   // Resolves c's relisting outcome and, once it is safe, removes c and any
-  // other stale sold duplicates of the same property. Confirmed-missing
-  // listings retain the existing manual-review protection. A listing whose
-  // own text/card says sold can be removed after a successful search even
-  // when that search finds no exact different-ID replacement.
+  // same-category stale duplicates. Every missing target is freshly checked
+  // before relisting work can cause a save or removal. A listing whose own
+  // text/card says sold retains the existing approved routing behavior.
   async function processSoldProperty(c, resolveFn) {
     if (c._removed) return { outcome: 'already-removed', removedCount: 0, removalFailed: false };
+    const removalTargets = [c, ...findSameRemovalCategoryDuplicates(c)].filter((target) => !target._removed);
+    const eligibleTargets = [];
+    const preflightSkipped = [];
+    for (const target of removalTargets) {
+      try {
+        const preflight = await preflightMissingRemoval(target);
+        if (preflight.eligible) {
+          eligibleTargets.push(target);
+        } else {
+          preflightSkipped.push({ id: String(target.id), finalClassification: preflight.finalClassification });
+        }
+      } catch (error) {
+        applyStatus(target, 'unknown');
+        preflightSkipped.push({ id: String(target.id), finalClassification: 'unknown' });
+        console.warn('[Fasteignir Helper] missing preflight was inconclusive for', target.id, error);
+      }
+    }
+    if (!eligibleTargets.some((target) => target.id === c.id)) {
+      return {
+        outcome: 'missing-preflight-failed',
+        removedCount: 0,
+        removalFailed: false,
+        preflightSkipped,
+      };
+    }
     let result;
     try {
-      result = await (resolveFn ? resolveFn(c) : resolveRelisting(c));
+      result = await (
+        resolveFn
+          ? resolveFn(c)
+          : resolveRelisting(
+            c,
+            eligibleTargets
+              .filter((target) => target.status === 'gone')
+              .map((target) => target.id)
+          )
+      );
     } catch (err) {
       console.error('[Fasteignir Helper] error resolving relisting for', c.id, err);
       return { outcome: 'error', removedCount: 0, removalFailed: false };
@@ -1596,8 +1678,7 @@
     let removedCount = 0;
     let removalFailed = false;
     if (shouldRemoveAfterRelisting(c.status, result.outcome)) {
-      const removalTargets = [c, ...findSoldDuplicates(c)];
-      for (const target of removalTargets) {
+      for (const target of eligibleTargets) {
         if (target._removed) continue;
         if (await removeSavedProperty(target)) {
           removedCount++;
@@ -1607,7 +1688,7 @@
       }
       if (removedCount > 0) saveStatusCache();
     }
-    return { ...result, removedCount, removalFailed };
+    return { ...result, removedCount, removalFailed, preflightSkipped };
   }
 
   // ---------- Price-change reporting ----------
@@ -1889,7 +1970,10 @@
     }
   }
 
-  function requestRedirectDiagnostic(c) {
+  // This deliberately uses a separate Tampermonkey transport. A second retry
+  // of the browser fetch would not be independent evidence for a destructive
+  // missing-listing decision.
+  function requestMissingConfirmationDiagnostic(c) {
     return new Promise((resolve) => {
       const startedAt = performance.now();
       let settled = false;
@@ -1986,13 +2070,13 @@
     });
   }
 
-  async function resolveRedirectStatus(c) {
+  async function resolveMissingConfirmation(c) {
     let result = null;
     let attempts = 0;
     for (const retryDelayMs of STATUS_TEST_RETRY_DELAYS_MS) {
       if (retryDelayMs > 0) await wait(retryDelayMs);
       attempts++;
-      result = await requestRedirectDiagnostic(c);
+      result = await requestMissingConfirmationDiagnostic(c);
       if (!result.retryable) break;
     }
     return {
@@ -2022,17 +2106,17 @@
     };
   }
 
-  function finalStatusClassification(c, initial, redirectResolution) {
+  function requiresMissingConfirmation(initial) {
+    return initial.classification === 'http-404' ||
+      initial.classification === 'not-found-page' ||
+      initial.classification === 'redirect';
+  }
+
+  function finalStatusClassification(c, initial, confirmation) {
     if (c.addressSaysSold) return 'confirmed-sold-address';
     if (initial.classification === 'sold-text') return 'confirmed-sold-text';
-    if (
-      initial.classification === 'http-404' ||
-      initial.classification === 'not-found-page'
-    ) {
-      return 'confirmed-missing';
-    }
-    if (initial.classification === 'redirect') {
-      return redirectResolution && redirectResolution.classification === 'confirmed-missing'
+    if (requiresMissingConfirmation(initial)) {
+      return confirmation && confirmation.classification === 'confirmed-missing'
         ? 'confirmed-missing'
         : 'unknown';
     }
@@ -2052,20 +2136,32 @@
       if (!result.retryable) break;
     }
 
-    const redirectResolution = result.classification === 'redirect'
-      ? await resolveRedirectStatus(c)
+    const confirmation = requiresMissingConfirmation(result)
+      ? await resolveMissingConfirmation(c)
       : null;
-    const finalClassification = finalStatusClassification(c, result, redirectResolution);
+    const finalClassification = finalStatusClassification(c, result, confirmation);
 
     return {
       ...statusFingerprint(c),
+      initialObservation: {
+        classification: result.classification,
+        httpStatus: result.status,
+        responseType: result.responseType,
+        finalUrl: result.finalUrl,
+        attempts,
+        error: result.error,
+      },
       initialClassification: result.classification,
       httpStatus: result.status,
       responseType: result.responseType,
       finalUrl: result.finalUrl,
       attempts,
-      redirectResolution,
+      confirmation,
       finalClassification,
+      detectionEligible:
+        finalClassification === 'confirmed-missing' ||
+        finalClassification === 'confirmed-sold-text' ||
+        finalClassification === 'confirmed-sold-address',
       wouldBeRemovalCandidate:
         finalClassification === 'confirmed-missing' ||
         finalClassification === 'confirmed-sold-text' ||
@@ -2295,7 +2391,7 @@
     const relistingOutcomes = countBy(relistingRows, (result) => result.relistingDryRun.outcome);
     const retriedProperties = results.filter((result) =>
       result.attempts > 1 ||
-      (result.redirectResolution && result.redirectResolution.attempts > 1)
+      (result.confirmation && result.confirmation.attempts > 1)
     ).length;
     const unresolved = results.filter((result) =>
       result.finalClassification === 'unknown'
@@ -2303,8 +2399,8 @@
     const confirmedRemovalCandidates = results.filter((result) => result.wouldBeRemovalCandidate);
 
     return {
-      reportVersion: 2,
-      scriptVersion: '4.0',
+      reportVersion: 3,
+      scriptVersion: '4.1',
       generatedAt: new Date().toISOString(),
       mode: 'report-only',
       propertiesChanged: 0,
@@ -2320,7 +2416,7 @@
         timeoutMs: STATUS_TEST_TIMEOUT_MS,
         maximumAttempts: STATUS_TEST_RETRY_DELAYS_MS.length,
         initialRedirectHandling: 'manual',
-        opaqueRedirectResolution: 'GM_xmlhttpRequest follow',
+        missingConfirmation: 'anonymous GM_xmlhttpRequest follow after a missing signal or redirect',
       },
       summary: {
         total: results.length,
@@ -2427,17 +2523,7 @@
     setBadge(c, 'Checking...', 'fdh-badge-checking');
     try {
       const result = await testOneStatus(c);
-      if (result.finalClassification === 'confirmed-missing') {
-        applyStatus(c, 'gone');
-      } else if (result.finalClassification === 'confirmed-sold-text') {
-        applyStatus(c, 'sold-text');
-      } else if (result.finalClassification === 'confirmed-sold-address') {
-        applyStatus(c, 'sold-address');
-      } else if (result.finalClassification === 'active') {
-        applyStatus(c, 'active');
-      } else {
-        applyStatus(c, 'unknown');
-      }
+      applyFinalStatusClassification(c, result.finalClassification);
     } catch (error) {
       console.warn('[Fasteignir Helper] status check was inconclusive for', c.url, error);
       applyStatus(c, 'unknown');
@@ -2477,9 +2563,10 @@
   // detection bug, or a property whose real status has simply changed since)
   // would otherwise get copied forward forever across repeated soft-refreshes
   // with nothing ever re-validating it.
-  // Version the cache key so no status produced by the retired unsafe fetch
-  // path can be restored into the validated classifier.
-  const CACHE_KEY = 'fdh_statusCache_v321';
+  // Preserve only active status across helper-triggered reloads. A stale
+  // active result can delay cleanup, while stale missing/unknown/sold evidence
+  // must never reappear as authority for a later removal.
+  const CACHE_KEY = 'fdh_statusCache_v410';
   const SKIP_FLAG_KEY = 'fdh_skipFullCheck';
   const CACHE_MAX_AGE_MS = 20 * 60 * 1000; // 20 minutes
 
@@ -2487,7 +2574,7 @@
     try {
       const map = {};
       cards.forEach((c) => {
-        map[c.id] = c.status;
+        if (c.status === 'active') map[c.id] = 'active';
       });
       sessionStorage.setItem(CACHE_KEY, JSON.stringify({ savedAt: Date.now(), statuses: map }));
     } catch (e) {
@@ -2546,8 +2633,8 @@
         try {
           cards.forEach((c) => {
             if (c.status === 'sold-address') return; // already known
-            if (cache[c.id] != null) {
-              applyStatus(c, cache[c.id]);
+            if (cache[c.id] === 'active') {
+              applyStatus(c, 'active');
             } else {
               uncached.push(c); // new since the last full check - check it for real
             }
@@ -2593,14 +2680,14 @@
       return;
     }
 
-    // Deduplicate exact property fingerprints so stale copies of the same
-    // property share one complete search/save/remove pipeline.
+    // Deduplicate exact property fingerprints only within the same safety
+    // category. Missing IDs cannot inherit a sold card's routing or evidence.
     function propertyKey(c) {
       return `${(c.street || '').trim().toLowerCase()}|${c.size}|${c.rooms}|${c.baths}|${c.beds}`;
     }
     const workByProperty = new Map();
     for (const card of toRemove) {
-      const key = propertyKey(card);
+      const key = `${card.status === 'gone' ? 'missing' : 'sold'}|${propertyKey(card)}`;
       if (!workByProperty.has(key)) workByProperty.set(key, card);
     }
     const workItems = Array.from(workByProperty.values());
@@ -2611,6 +2698,7 @@
     let relistingsSaved = 0;
     let alreadySavedLive = 0;
     let unresolvedOperations = 0;
+    const preflightSkipped = [];
 
     function updateStatus(progress) {
       const removedCount = toRemove.filter((c) => c._removed).length;
@@ -2638,6 +2726,13 @@
         if (progress.phase === 'completed') {
           const result = progress.result;
           const c = result.card;
+          if (result.preflightSkipped && result.preflightSkipped.length > 0) {
+            preflightSkipped.push(...result.preflightSkipped);
+            console.warn(
+              '[Fasteignir Helper] leaving fresh-preflight failures in place:',
+              result.preflightSkipped
+            );
+          }
           if (result.outcome === 'area-mismatch') {
             areaMismatchAddresses.push(c.street);
           } else if (result.outcome === 'results-no-match') {
@@ -2676,6 +2771,10 @@
     }
     if (uncertainCount > 0) {
       message += ` ${uncertainCount} could not be confirmed and ${uncertainCount === 1 ? 'was' : 'were'} left in your saved list. Please check manually.`;
+    }
+    if (preflightSkipped.length > 0) {
+      const reasons = preflightSkipped.map((row) => `${row.id}: ${row.finalClassification}`);
+      message += `\nFresh missing confirmation skipped: ${reasons.join(', ')}.`;
     }
     if (priceChanges.length > 0) {
       message += `\nPrice changes:\n${priceChanges.join('\n')}`;
